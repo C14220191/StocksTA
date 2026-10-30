@@ -33,6 +33,44 @@ export function formatIndicator(v, unit, currency) {
   return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+// Label zona waktu lokal browser: WIB/WITA/WIT, selain itu "UTC+x".
+function tzLabel(d) {
+  const off = -d.getTimezoneOffset();
+  const named = { 420: "WIB", 480: "WITA", 540: "WIT" }[off];
+  if (named) return named;
+  const h = off / 60;
+  return `UTC${h >= 0 ? "+" : ""}${Number.isInteger(h) ? h : h.toFixed(1)}`;
+}
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const localHM = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+
+// Ringkasan AI menyebut waktu dalam UTC karena candle di prompt berformat UTC
+// (mis. "2026-10-29T22:00Z" atau "01:00Z"). Untuk tampilan, ubah ke waktu lokal:
+// "30 Okt 05:00 WIB" / "08:00 WIB". Teks asli di database tidak diubah.
+// refIso = waktu analisis dibuat, untuk menentukan tanggal dari jam tanpa tanggal.
+export function localizeUtcTimes(text, refIso) {
+  if (!text) return text;
+  const full = /\b(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(?:Z|\+00:00|\s?UTC)/g;
+  let out = text.replace(full, (m, date, hh, mm) => {
+    const d = new Date(`${date}T${hh}:${mm}:00Z`);
+    if (Number.isNaN(d.getTime())) return m;
+    const day = d.toLocaleDateString("id-ID", { day: "numeric", month: "short" });
+    return `${day} ${localHM(d)} ${tzLabel(d)}`;
+  });
+
+  const ref = refIso ? new Date(refIso) : new Date();
+  const timeOnly = /\b(\d{1,2})[:.](\d{2})\s?(?:Z|UTC)\b/g;
+  out = out.replace(timeOnly, (m, hh, mm) => {
+    if (+hh > 23 || +mm > 59) return m;
+    // Kejadian terakhir jam UTC itu, pada atau sebelum waktu analisis.
+    const d = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth(), ref.getUTCDate(), +hh, +mm));
+    if (d > ref) d.setUTCDate(d.getUTCDate() - 1);
+    return `${localHM(d)} ${tzLabel(d)}`;
+  });
+  return out;
+}
+
 // detik UTC -> waktu lokal browser
 export function formatCandleTime(sec, dateOnly = false) {
   const d = new Date(sec * 1000);

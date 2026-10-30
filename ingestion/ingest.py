@@ -1,7 +1,7 @@
 """Ingestion OHLCV ke PostgreSQL (tabel ohlcv).
 
 Pemakaian:
-    python ingestion/ingest.py --timeframe 1h              # update rutin (dijadwalkan tiap jam, menit ke-5)
+    python ingestion/ingest.py --timeframe 1h              # update rutin incremental (tiap jam, menit ke-5)
     python ingestion/ingest.py --timeframe 1d
     python ingestion/ingest.py --timeframe 1h --backfill   # isi ulang sekitar 1 tahun (jalankan sekali)
     python ingestion/ingest.py --timeframe 1d --backfill
@@ -38,9 +38,13 @@ INSTRUMENTS = [
 ]
 
 INTERVAL_MS = {"1h": 3_600_000, "1d": 86_400_000}
-YAHOO_PERIOD = {"1h": "60d", "1d": "1y"}
 YAHOO_PERIOD_BACKFILL = {"1h": "1y", "1d": "1y"}
 
+INTERVAL_SQL = {"1h": "1 hour", "1d": "1 day"}
+
+# fetched_at hanya diperbarui kalau candle sebelumnya masih berjalan atau nilainya berubah.
+# Tanpa syarat ini, setiap run menimpa fetched_at candle lama dengan now(), sehingga
+# fetched_at tidak lagi berarti "kapan candle ini pertama kali diambil dalam keadaan final".
 UPSERT_SQL = """
 INSERT INTO ohlcv (instrument_id, timeframe, ts, open, high, low, close, volume, fetched_at)
 VALUES %s
@@ -50,7 +54,10 @@ ON CONFLICT (instrument_id, timeframe, ts) DO UPDATE SET
     low = EXCLUDED.low,
     close = EXCLUDED.close,
     volume = EXCLUDED.volume,
-    fetched_at = now();
+    fetched_at = now()
+WHERE ohlcv.fetched_at < ohlcv.ts + interval '{interval}'
+   OR (ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close, ohlcv.volume)
+      IS DISTINCT FROM (EXCLUDED.open, EXCLUDED.high, EXCLUDED.low, EXCLUDED.close, EXCLUDED.volume);
 """
 
 
@@ -63,24 +70,25 @@ def _binance_page(symbol, timeframe, limit, start_ms=None):
     return r.json()
 
 
-def fetch_binance(symbol, timeframe, backfill=False):
-    """Kembalikan list (ts_utc, open, high, low, close, volume). ts = waktu BUKA candle."""
-    if not backfill:
-        pages = [_binance_page(symbol, timeframe, 500)]
-    else:
-        pages = []
-        step = INTERVAL_MS[timeframe]
-        start = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp() * 1000)
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        while start < now_ms:
-            page = _binance_page(symbol, timeframe, 1000, start)
-            if not page:
-                break
-            pages.append(page)
-            next_start = int(page[-1][0]) + step
-            if next_start <= start:
-                break
-            start = next_start
+def fetch_binance(symbol, timeframe, since=None):
+    """Kembalikan list (ts_utc, open, high, low, close, volume). ts = waktu BUKA candle.
+    since = ts candle terakhir di DB (ikut diambil ulang karena mungkin masih berjalan);
+    None = backfill sekitar 1 tahun."""
+    pages = []
+    step = INTERVAL_MS[timeframe]
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(days=365)
+    start = int(since.timestamp() * 1000)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    while start <= now_ms:
+        page = _binance_page(symbol, timeframe, 1000, start)
+        if not page:
+            break
+        pages.append(page)
+        next_start = int(page[-1][0]) + step
+        if next_start <= start:
+            break
+        start = next_start
     rows = []
     for page in pages:
         for k in page:
@@ -91,9 +99,14 @@ def fetch_binance(symbol, timeframe, backfill=False):
     return rows
 
 
-def fetch_yahoo(symbol, timeframe, backfill=False):
-    period = (YAHOO_PERIOD_BACKFILL if backfill else YAHOO_PERIOD)[timeframe]
-    df = yf.Ticker(symbol).history(period=period, interval=timeframe, auto_adjust=False)
+def fetch_yahoo(symbol, timeframe, since=None):
+    t = yf.Ticker(symbol)
+    if since is None:
+        df = t.history(period=YAHOO_PERIOD_BACKFILL[timeframe], interval=timeframe, auto_adjust=False)
+    else:
+        # Yahoo memakai granularitas tanggal; mundur 2 hari supaya candle terakhir pasti ikut.
+        start = (since - timedelta(days=2)).date()
+        df = t.history(start=start, interval=timeframe, auto_adjust=False)
     if df is None or df.empty:
         raise RuntimeError("data kosong dari Yahoo")
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -119,17 +132,23 @@ def main():
     with conn, conn.cursor() as cur:
         cur.execute("SELECT symbol, id FROM instruments")
         ids = dict(cur.fetchall())
+        cur.execute("SELECT instrument_id, max(ts) FROM ohlcv WHERE timeframe = %s GROUP BY 1",
+                    (args.timeframe,))
+        last_ts = dict(cur.fetchall())
+    upsert = UPSERT_SQL.format(interval=INTERVAL_SQL[args.timeframe])
 
     for symbol, source in INSTRUMENTS:
         try:
             if symbol not in ids:
                 raise RuntimeError("instrument belum ada di tabel instruments")
-            rows = (fetch_binance if source == "binance" else fetch_yahoo)(symbol, args.timeframe, args.backfill)
+            since = None if args.backfill else last_ts.get(ids[symbol])
+            rows = (fetch_binance if source == "binance" else fetch_yahoo)(symbol, args.timeframe, since)
             values = [(ids[symbol], args.timeframe, *r) for r in rows]
             with conn, conn.cursor() as cur:
-                execute_values(cur, UPSERT_SQL, values,
+                execute_values(cur, upsert, values,
                                template="(%s, %s, %s, %s, %s, %s, %s, %s, now())", page_size=1000)
-            print(f"[ok]   {symbol} ({source}) {args.timeframe}: {len(rows)} candle")
+            mode = "backfill" if since is None else f"sejak {since:%Y-%m-%d %H:%M}"
+            print(f"[ok]   {symbol} ({source}) {args.timeframe}: {len(rows)} candle ({mode})")
         except Exception as e:  # satu instrument gagal tidak menghentikan yang lain
             print(f"[fail] {symbol}: {e}")
     conn.close()

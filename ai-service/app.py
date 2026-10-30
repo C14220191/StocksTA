@@ -8,7 +8,8 @@ Konfigurasi lewat environment (diisi dari run.env):
     HERMES_REASONING        default "none"
     HERMES_TIMEOUT          default 120 (detik, per proses Hermes)
     HERMES_MAX_CONCURRENCY  default 1 (jumlah proses Hermes yang boleh jalan bersamaan)
-    PROMPT_VERSION          default "hermes-v2" (naikkan setiap prompt diubah)
+    HERMES_QUEUE_TIMEOUT    default 180 (detik maksimal menunggu giliran; lewat -> 503)
+    PROMPT_VERSION          default "hermes-v3" (naikkan setiap prompt diubah)
     PRICE_IN_PER_M, PRICE_OUT_PER_M, PRICE_CACHE_READ_PER_M
                             harga resmi model (USD per juta token). Kalau salah satunya > 0,
                             cost_usd dihitung sendiri (biaya setara); kalau semuanya 0,
@@ -19,9 +20,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
+import time
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -33,7 +36,8 @@ HERMES_TOOLSETS = os.environ.get("HERMES_TOOLSETS", "clarify")
 HERMES_REASONING = os.environ.get("HERMES_REASONING", "none")
 HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT", "120"))
 MAX_CONCURRENCY = int(os.environ.get("HERMES_MAX_CONCURRENCY", "1"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "hermes-v2")
+QUEUE_TIMEOUT = int(os.environ.get("HERMES_QUEUE_TIMEOUT", "180"))
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "hermes-v3")
 PRICE_IN = float(os.environ.get("PRICE_IN_PER_M", "0") or 0)
 PRICE_OUT = float(os.environ.get("PRICE_OUT_PER_M", "0") or 0)
 PRICE_CACHE = float(os.environ.get("PRICE_CACHE_READ_PER_M", "0") or 0)
@@ -58,6 +62,9 @@ class AnalyzeRequest(BaseModel):
     symbol: str
     timeframe: str = "1h"
     candles: list[CandleIn]
+    # Harga terkini (price feed / close terbaru) saat request; None = tidak dikirim backend.
+    last_price: float | None = None
+    last_price_ts: str | None = None
 
 
 def build_prompt(req: AnalyzeRequest) -> str:
@@ -66,10 +73,16 @@ def build_prompt(req: AnalyzeRequest) -> str:
         f"{c.ts} O={c.open:g} H={c.high:g} L={c.low:g} C={c.close:g} V={c.volume:g}"
         for c in req.candles
     )
+    # Harga terkini membuat summary ikut berubah saat harga bergerak di tengah candle berjalan;
+    # tanpa ini, regenerasi akibat event invalidation memberi input yang sama persis.
+    live = ""
+    if req.last_price:
+        live = f"Harga terkini {req.last_price:g} pada {req.last_price_ts or 'saat ini'} UTC. "
     # Sengaja tanpa tanda kutip ganda: lebih aman sebagai argumen command line di Windows.
     return (
         f"Kamu analis pasar. Instrument: {req.symbol}, timeframe {req.timeframe}, "
         f"{len(req.candles)} candle terakhir (waktu UTC, format O/H/L/C/V): {rows}. "
+        f"{live}"
         "Analisis hanya berdasarkan data tersebut. "
         "Balas HANYA dengan satu objek JSON valid, tanpa teks lain dan tanpa markdown, "
         "dengan kunci: summary (ringkasan analisis teknikal Bahasa Indonesia, maksimal 80 kata), "
@@ -179,6 +192,22 @@ def equivalent_cost(tokens_in: int, tokens_out: int, cache_read: int, reported: 
 
 
 def run_hermes(prompt: str, last_close: float) -> dict:
+    # Antrean dibatasi waktunya supaya saat load test (k6) request tidak menumpuk tanpa batas.
+    t0 = time.monotonic()
+    if not _sem.acquire(timeout=QUEUE_TIMEOUT):
+        raise HTTPException(503, f"antrean Hermes penuh lebih dari {QUEUE_TIMEOUT} detik")
+    queue_ms = int((time.monotonic() - t0) * 1000)
+    try:
+        t1 = time.monotonic()
+        out = _run_hermes(prompt, last_close)
+        out["exec_ms"] = int((time.monotonic() - t1) * 1000)
+        out["queue_ms"] = queue_ms
+        return out
+    finally:
+        _sem.release()
+
+
+def _run_hermes(prompt: str, last_close: float) -> dict:
     with tempfile.TemporaryDirectory() as td:
         usage_path = os.path.join(td, "usage.json")
         cmd = [
@@ -192,11 +221,10 @@ def run_hermes(prompt: str, last_close: float) -> dict:
         if HERMES_PROVIDER:
             cmd += ["--provider", HERMES_PROVIDER]
         try:
-            with _sem:  # batasi jumlah proses Hermes yang jalan bersamaan
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", timeout=HERMES_TIMEOUT,
-                )
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=HERMES_TIMEOUT,
+            )
         except FileNotFoundError:
             raise HTTPException(500, f"HERMES_BIN tidak ditemukan: {HERMES_BIN}")
         except subprocess.TimeoutExpired:
@@ -232,8 +260,10 @@ def run_hermes(prompt: str, last_close: float) -> dict:
 
 @app.get("/health")
 def health():
+    hermes_found = shutil.which(HERMES_BIN) is not None
     return {
-        "status": "ok",
+        "status": "ok" if hermes_found else "degraded",
+        "hermes_bin": HERMES_BIN if hermes_found else f"TIDAK DITEMUKAN: {HERMES_BIN}",
         "prompt_version": PROMPT_VERSION,
         "model": HERMES_MODEL or "(default hermes)",
         "provider": HERMES_PROVIDER or "(default hermes)",
@@ -248,4 +278,5 @@ async def analyze(req: AnalyzeRequest):
     if len(req.candles) < 3:
         raise HTTPException(422, "minimal 3 candle")
     # subprocess blocking dijalankan di thread, supaya event loop tetap hidup dan portable di Windows
-    return await asyncio.to_thread(run_hermes, build_prompt(req), req.candles[-1].close)
+    ref_price = req.last_price or req.candles[-1].close  # rentang wajar support/resistance
+    return await asyncio.to_thread(run_hermes, build_prompt(req), ref_price)

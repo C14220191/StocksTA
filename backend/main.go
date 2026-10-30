@@ -38,18 +38,32 @@ func main() {
 	}
 
 	// CACHE_MODE menentukan kondisi eksperimen: no_cache | static_ttl | dynamic_ttl | event_only | hybrid
+	store := &Store{pool: pool}
 	cacheMode := env("CACHE_MODE", "no_cache")
-	policy, err := NewPolicy(cacheMode)
+	policy, err := NewPolicy(ctx, cacheMode, store)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	ai := NewAIClient(env("AI_MODE", "stub"), env("AI_URL", "http://127.0.0.1:8000/analyze"))
 
+	// Price feed berjalan di SEMUA kondisi (termasuk no_cache), supaya harga di prompt dan
+	// metrik freshness berbasis harga diukur dengan cara yang sama di setiap kondisi.
+	var prices *PriceFeed
+	if env("PRICE_FEED", "on") == "on" {
+		syms, err := store.SymbolsBySource(ctx, "binance")
+		if err != nil {
+			log.Fatalf("baca instrument binance: %v", err)
+		}
+		prices = NewPriceFeed(syms)
+		go prices.Run(ctx)
+	}
+
 	app := &App{
-		store:  &Store{pool: pool},
+		store:  store,
 		policy: policy,
 		ai:     ai,
+		prices: prices,
 	}
 
 	e := echo.New()
@@ -60,9 +74,7 @@ func main() {
 		AllowOrigins: strings.Split(env("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"), ","),
 		AllowMethods: []string{http.MethodGet},
 	}))
-	e.GET("/health", func(c echo.Context) error {
-		return c.JSON(200, map[string]string{"status": "ok", "cache_mode": policy.Name()})
-	})
+	e.GET("/health", app.Health)
 
 	// AI inference (melewati cache policy dan dicatat ke inference_log = data eksperimen)
 	e.GET("/api/analyze/:symbol", app.Analyze)

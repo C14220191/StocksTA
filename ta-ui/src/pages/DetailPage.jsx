@@ -11,18 +11,25 @@ import {
   assetLabel,
   changeClass,
   formatAgeSeconds,
+  formatCandleTime,
   formatChange,
   formatPrice,
   formatVolume,
+  localizeUtcTimes,
 } from "../lib/format.js";
 
-// Rentang di mockup (1D, 1W, 1M, 3M) = parameter `range`; ukuran candle = parameter `tf`.
-const RANGES = ["1D", "1W", "1M", "3M"];
+// Rentang = parameter `range`; ukuran candle = parameter `tf`.
+const RANGES = ["1D", "1W", "1M", "3M", "6M", "1Y", "ALL"];
+const RANGE_LABEL = { ALL: "Semua" };
 const TIMEFRAMES = ["1h", "2h", "4h", "6h", "1d"];
-const RANGE_HOURS = { "1D": 24, "1W": 168, "1M": 720, "3M": 2160 };
+// ALL = seluruh data di database (sekitar 1 tahun), dianggap 1 tahun untuk batas jumlah candle.
+const RANGE_HOURS = { "1D": 24, "1W": 168, "1M": 720, "3M": 2160, "6M": 4368, "1Y": 8760, ALL: 8760 };
 const TF_HOURS = { "1h": 1, "2h": 2, "4h": 4, "6h": 6, "1d": 24 };
 
-// Aturan backend: jumlah candle = rentang / tf, minimal 6 dan maksimal 1000.
+// Harga bergerak sejauh ini (persen) sejak analisis dibuat -> tampilkan peringatan di panel AI.
+const MOVE_WARN_PCT = 1;
+
+// Backend menerima 6 sampai 10.000 candle; UI membatasi 1.000 supaya chart dan indikator tetap ringan.
 const tfAllowed = (range, tf) => {
   const n = RANGE_HOURS[range] / TF_HOURS[tf];
   return n >= 6 && n <= 1000;
@@ -78,11 +85,24 @@ function SegButton({ selected, disabled, title, onClick, children }) {
   );
 }
 
-function AiPanel({ latest, ai, currency }) {
+// Asal ringkasan yang tampil: dibuat AI untuk kunjungan ini (MISS/BYPASS), dari cache (HIT),
+// atau ringkasan tersimpan terakhir yang ditampilkan sambil menunggu /api/analyze.
+function analysisOrigin(fresh) {
+  if (!fresh) return "Analisis tersimpan, dibuat";
+  if (fresh.cache_status === "HIT") return "Dari cache, dianalisis";
+  return "Analisis baru, dibuat";
+}
+
+function AiPanel({ latest, ai, currency, livePrice }) {
   const fresh = ai.data;
   const shown = fresh ?? latest; // tampilkan ringkasan tersimpan dulu sambil menunggu analisis terbaru
-  const ageSec = fresh ? fresh.data_age_seconds : ageSecondsFromIso(latest?.source_data_ts);
   const hasLevels = shown?.support != null && shown?.resistance != null;
+  // source_data_ts = waktu BUKA candle 1h terakhir yang dilihat AI; candle itu tutup 1 jam kemudian.
+  const dataUntil = shown?.source_data_ts ? new Date(shown.source_data_ts).getTime() / 1000 + 3600 : null;
+  const priceAtGen = fresh?.price_at_generation > 0 ? fresh.price_at_generation : null; // ai_latest belum membawa harga
+  // Kripto: dihitung ulang dari harga live supaya ikut bergerak; saham: nilai dari backend.
+  const deviation = priceAtGen && livePrice ? (livePrice / priceAtGen - 1) * 100 : fresh?.price_deviation_pct ?? null;
+  const moved = deviation != null && Math.abs(deviation) >= MOVE_WARN_PCT;
 
   return (
     <section className="bg-panel p-6 font-sans" aria-live="polite">
@@ -101,14 +121,26 @@ function AiPanel({ latest, ai, currency }) {
 
       {shown && (
         <>
-          <p className="mt-3 whitespace-pre-line text-sm leading-relaxed">{shown.summary}</p>
+          <p className="mt-3 whitespace-pre-line text-sm leading-relaxed">
+            {localizeUtcTimes(shown.summary, shown.generated_at)}
+          </p>
           {hasLevels && (
             <p className="mt-3 text-xs text-muted">
               Level menurut AI: support {formatPrice(shown.support, currency, { short: true })} · resistance{" "}
               {formatPrice(shown.resistance, currency, { short: true })}
             </p>
           )}
-          <p className="mt-4 text-xs text-muted">Berdasarkan data {formatAgeSeconds(ageSec)}</p>
+          <p className="mt-4 text-xs text-muted">
+            {analysisOrigin(fresh)} {formatCandleTime(new Date(shown.generated_at).getTime() / 1000)} (
+            {formatAgeSeconds(ageSecondsFromIso(shown.generated_at))})
+            {dataUntil && <> · data candle hingga {formatCandleTime(dataUntil)}</>}
+            {priceAtGen && <> · harga saat analisis {formatPrice(priceAtGen, currency, { short: true })}</>}
+          </p>
+          {moved && (
+            <p className="mt-2 text-xs text-hold">
+              Harga sudah bergerak {formatChange(deviation)} sejak analisis ini dibuat, ringkasan mungkin kurang relevan.
+            </p>
+          )}
           {ai.loading && (
             <p className="mt-2 flex items-center gap-2 text-xs text-hold">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-hold" />
@@ -209,7 +241,7 @@ export default function DetailPage({ symbol }) {
         <Segmented label="Rentang waktu">
           {RANGES.map((r) => (
             <SegButton key={r} selected={range === r} onClick={() => changeRange(r)}>
-              {r}
+              {RANGE_LABEL[r] ?? r}
             </SegButton>
           ))}
         </Segmented>
@@ -276,7 +308,7 @@ export default function DetailPage({ symbol }) {
           {stats?.basis && <p className="col-span-2 font-sans text-xs text-muted">Dasar: {stats.basis}</p>}
         </div>
 
-        <AiPanel latest={detail.data?.ai_latest} ai={ai} currency={currency} />
+        <AiPanel latest={detail.data?.ai_latest} ai={ai} currency={currency} livePrice={livePrice} />
       </div>
     </div>
   );

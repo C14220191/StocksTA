@@ -128,6 +128,18 @@ Ada dua pasang support/resistance:
 
 Respons berisi `cache_status`, `signal`, `summary`, `support`, `resistance`, `latency_ms`, `tokens_in`, `data_age_seconds`, dan lainnya. `support`/`resistance` dari AI, `null` kalau tidak valid. Bisa makan 5 sampai 15 detik kalau MISS, jadi tampilkan `ai_latest` dulu sambil menunggu, atau loading state.
 
+Field freshness (semua opsional untuk UI):
+
+| Field | Arti |
+|---|---|
+| `generated_at` | Kapan summary dibuat AI |
+| `cache_age_seconds` | Lama summary tinggal di cache (`0` saat MISS/BYPASS) |
+| `price_at_generation` | Harga yang dilihat AI saat summary dibuat |
+| `price_at_request` | Harga saat request ini dilayani (live untuk kripto, close 1h terakhir untuk saham) |
+| `price_deviation_pct` | `(price_at_request / price_at_generation - 1) * 100`, bisa negatif; `null` kalau harga tidak diketahui |
+
+Header opsional `X-TA-Trigger: ui | k6 | scheduled | manual` (default `ui`) menandai sumber request di `inference_log`. UI tidak perlu mengirimnya; k6 wajib mengirim `k6`.
+
 ## Error
 
 `404 {"error":"instrument tidak ditemukan"}`, `400` untuk `type`/`range` tidak valid, `422` kalau data harga belum ada.

@@ -2,13 +2,17 @@
 # Pemakaian (dari folder proyek, mis. C:\ta):
 #   .\ta-up.ps1 status
 #   .\ta-up.ps1 build                          # build backend\ta-backend.exe
-#   .\ta-up.ps1 restart [CACHE_MODE] [AI_MODE] # contoh: .\ta-up.ps1 restart static_ttl http
+#   .\ta-up.ps1 restart [CACHE_MODE] [AI_MODE] [THRESHOLD]
+#                                              # contoh: .\ta-up.ps1 restart hybrid http 2
 #   .\ta-up.ps1 stop
 #   .\ta-up.ps1 ingest                         # ambil data terbaru (dipanggil Task Scheduler tiap jam)
+#   .\ta-up.ps1 backtest                       # isi price_after_24h + signal_correct (boleh dijadwalkan)
+#   .\ta-up.ps1 migrate 004_measurement.sql    # jalankan satu file migrations\ ke database yang sudah ada
 param(
     [Parameter(Position = 0)][string]$Action = "status",
     [Parameter(Position = 1)][string]$CacheMode,
-    [Parameter(Position = 2)][string]$AiMode
+    [Parameter(Position = 2)][string]$AiMode,
+    [Parameter(Position = 3)][string]$Threshold
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +20,6 @@ $Root     = $PSScriptRoot
 $RunEnv   = Join-Path $Root "run.env"
 $LogDir   = Join-Path $Root "logs"
 $Python   = Join-Path $Root ".venv\Scripts\python.exe"
-$Uvicorn  = Join-Path $Root ".venv\Scripts\uvicorn.exe"
 $Backend  = Join-Path $Root "backend\ta-backend.exe"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 
@@ -60,8 +63,10 @@ function Stop-Services {
 function Start-Services {
     Import-EnvFile (Join-Path $Root ".env")
     Import-EnvFile $RunEnv
-    $api = Start-Process -FilePath $Uvicorn `
-        -ArgumentList "app:app", "--host", "127.0.0.1", "--port", "8000" `
+    # python -m uvicorn, bukan uvicorn.exe: launcher .exe menyimpan path venv absolut dan rusak
+    # kalau folder proyek dipindah.
+    $api = Start-Process -FilePath $Python `
+        -ArgumentList "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "8000" `
         -WorkingDirectory (Join-Path $Root "ai-service") `
         -RedirectStandardOutput (Join-Path $LogDir "api.out.log") `
         -RedirectStandardError (Join-Path $LogDir "api.err.log") `
@@ -76,7 +81,7 @@ function Start-Services {
 }
 
 function Show-Status {
-    Write-Host ("mode   : " + ((Get-Content $RunEnv | Where-Object { $_ -match "^(CACHE_MODE|AI_MODE)=" }) -join " "))
+    Write-Host ("mode   : " + ((Get-Content $RunEnv | Where-Object { $_ -match "^(CACHE_MODE|AI_MODE|INVALIDATION_THRESHOLD_PCT|PROMPT_VERSION)=" }) -join " "))
     Write-Host ("Go     : " + (Get-Health "http://127.0.0.1:8080/health"))
     Write-Host ("FastAPI: " + (Get-Health "http://127.0.0.1:8000/health"))
 }
@@ -95,6 +100,10 @@ switch ($Action) {
             if ($AiMode -notmatch '^(stub|http)$') { throw "AI_MODE tidak valid: $AiMode" }
             Set-RunEnv "AI_MODE" $AiMode
         }
+        if ($Threshold) {
+            if ($Threshold -notmatch '^\d+(\.\d+)?$') { throw "THRESHOLD tidak valid: $Threshold" }
+            Set-RunEnv "INVALIDATION_THRESHOLD_PCT" $Threshold
+        }
         Stop-Services
         Start-Sleep -Seconds 1
         Start-Services
@@ -109,6 +118,18 @@ switch ($Action) {
         Import-EnvFile (Join-Path $Root ".env")
         & $Python (Join-Path $Root "ingestion\ingest.py") --timeframe 1h
         & $Python (Join-Path $Root "ingestion\ingest.py") --timeframe 1d
+    }
+    "backtest" {
+        Import-EnvFile (Join-Path $Root ".env")
+        & $Python (Join-Path $Root "ingestion\backtest.py")
+    }
+    "migrate" {
+        # Lewat stdin, jadi tidak bergantung pada folder yang di-mount container.
+        $file = Join-Path $Root "migrations\$CacheMode"
+        if (-not $CacheMode -or -not (Test-Path $file)) { throw "Pakai: .\ta-up.ps1 migrate <nama file di migrations\>" }
+        Get-Content $file -Raw | docker exec -i ta_postgres psql -U ta_user -d ta_db -v ON_ERROR_STOP=1 -q
+        if ($LASTEXITCODE -ne 0) { throw "migrasi gagal" }
+        Write-Host "migrasi $CacheMode OK"
     }
     "status" { Show-Status }
     default  { throw "Aksi tidak dikenal: $Action" }

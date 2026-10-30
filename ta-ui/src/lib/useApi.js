@@ -22,12 +22,3 @@ export default function useApi(fetcher, deps) {
   const reload = useCallback(() => setTick((t) => t + 1), []);
   return { ...state, reload };
 }
-
-export function useDebounced(value, ms = 300) {
-  const [v, setV] = useState(value);
-  useEffect(() => {
-    const t = setTimeout(() => setV(value), ms);
-    return () => clearTimeout(t);
-  }, [value, ms]);
-  return v;
-}

@@ -31,16 +31,26 @@ type AIResult struct {
 	PromptVersion   string   `json:"prompt_version"`
 	Support         *float64 `json:"support"`    // level dari AI, nil kalau tidak valid
 	Resistance      *float64 `json:"resistance"` // level dari AI, nil kalau tidak valid
+	FormatOK        *bool    `json:"format_ok"`  // output AI berupa JSON valid
+	QueueMS         *int     `json:"queue_ms"`   // menunggu giliran proses Hermes
+	ExecMS          *int     `json:"exec_ms"`    // proses Hermes berjalan
 }
 
 type AIClient interface {
-	Analyze(ctx context.Context, symbol string, candles []Candle) (*AIResult, error)
+	// quote = harga terkini, ikut dikirim ke prompt supaya summary mencerminkan pergerakan
+	// sejak candle terakhir tutup (penting untuk event-driven invalidation).
+	Analyze(ctx context.Context, symbol string, candles []Candle, quote Quote) (*AIResult, error)
 }
 
 // NewAIClient: mode "http" memanggil layanan FastAPI, selain itu memakai stub (tanpa token).
 func NewAIClient(mode, url string) AIClient {
 	if mode == "http" {
-		return &httpAI{url: url, client: &http.Client{Timeout: 5 * time.Minute}}
+		// Harus lebih besar dari HERMES_QUEUE_TIMEOUT + HERMES_TIMEOUT di AI service.
+		sec, err := strconv.Atoi(env("AI_TIMEOUT_SECONDS", "330"))
+		if err != nil || sec <= 0 {
+			sec = 330
+		}
+		return &httpAI{url: url, client: &http.Client{Timeout: time.Duration(sec) * time.Second}}
 	}
 	delay := 300
 	if v, err := strconv.Atoi(env("STUB_DELAY_MS", "300")); err == nil && v >= 0 {
@@ -53,7 +63,7 @@ func NewAIClient(mode, url string) AIClient {
 
 type stubAI struct{ delay time.Duration }
 
-func (s *stubAI) Analyze(ctx context.Context, symbol string, candles []Candle) (*AIResult, error) {
+func (s *stubAI) Analyze(ctx context.Context, symbol string, candles []Candle, _ Quote) (*AIResult, error) {
 	select {
 	case <-time.After(s.delay):
 	case <-ctx.Done():
@@ -75,6 +85,7 @@ func (s *stubAI) Analyze(ctx context.Context, symbol string, candles []Candle) (
 	tokensIn := 300 + 25*len(candles)
 	tokensOut := 120
 	cost := float64(tokensIn)*stubPriceInPerM/1e6 + float64(tokensOut)*stubPriceOutPerM/1e6
+	ok, execMS, queueMS := true, int(s.delay.Milliseconds()), 0
 	return &AIResult{
 		Content:       fmt.Sprintf("Ringkasan stub untuk %s dari %d candle.", symbol, len(candles)),
 		Signal:        signal,
@@ -85,6 +96,9 @@ func (s *stubAI) Analyze(ctx context.Context, symbol string, candles []Candle) (
 		PromptVersion: "stub",
 		Support:       &lo,
 		Resistance:    &hi,
+		FormatOK:      &ok,
+		QueueMS:       &queueMS,
+		ExecMS:        &execMS,
 	}, nil
 }
 
@@ -105,13 +119,19 @@ type aiCandle struct {
 }
 
 type aiRequest struct {
-	Symbol    string     `json:"symbol"`
-	Timeframe string     `json:"timeframe"`
-	Candles   []aiCandle `json:"candles"`
+	Symbol      string     `json:"symbol"`
+	Timeframe   string     `json:"timeframe"`
+	Candles     []aiCandle `json:"candles"`
+	LastPrice   float64    `json:"last_price,omitempty"`
+	LastPriceTS string     `json:"last_price_ts,omitempty"`
 }
 
-func (h *httpAI) Analyze(ctx context.Context, symbol string, candles []Candle) (*AIResult, error) {
+func (h *httpAI) Analyze(ctx context.Context, symbol string, candles []Candle, quote Quote) (*AIResult, error) {
 	req := aiRequest{Symbol: symbol, Timeframe: analysisTimeframe}
+	if quote.Price > 0 {
+		req.LastPrice = quote.Price
+		req.LastPriceTS = quote.TS.UTC().Format(time.RFC3339)
+	}
 	for _, c := range candles {
 		req.Candles = append(req.Candles, aiCandle{
 			TS: c.TS.UTC().Format(time.RFC3339), Open: c.Open, High: c.High,

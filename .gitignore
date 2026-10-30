@@ -16,6 +16,9 @@ logs/
 node_modules/
 dist/
 
+# Catatan progres pribadi (konteks sesi Claude Code)
+docs/CHECKPOINT.md
+
 # Editor / OS
 .vscode/
 .idea/
