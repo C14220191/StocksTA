@@ -1,0 +1,23 @@
+# Secret (password database dll). Konfigurasi non-secret ada di run.env.
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Go: hasil build
+backend/*.exe
+
+# Log dan PID dari ta-up.ps1
+logs/
+
+# Node / Vite (ta-ui juga punya .gitignore sendiri)
+node_modules/
+dist/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
