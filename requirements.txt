@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+yfinance
+psycopg2-binary
+requests

@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+/* Color palette + font dari mockup. Ubah di sini saja, semua halaman (dan chart) ikut berubah.
+   `static` memastikan semua variabel selalu ada di :root, karena PriceChart.jsx membacanya lewat JS. */
+@theme static {
+  --color-canvas: #0a0e16;       /* latar paling luar & header tabel */
+  --color-surface: #0e1420;      /* latar halaman */
+  --color-panel: #131a28;        /* kartu, kotak search */
+  --color-panel-2: #1a2233;      /* stat card, tab aktif, chip */
+  --color-line: #2a3345;         /* border tabel & kartu */
+  --color-line-strong: #8a93a5;  /* garis di bawah header */
+  --color-ink: #f4f6fa;          /* teks utama */
+  --color-muted: #8d96a8;        /* teks sekunder */
+  --color-up: #86efac;           /* naik / Buy */
+  --color-down: #ff5a5f;         /* turun / Sell */
+  --color-hold: #f5a524;         /* Hold / chip aktif */
+
+  --font-serif: "Newsreader", Georgia, serif;
+  --font-sans: "Inter", system-ui, sans-serif;
+}
+
+@layer base {
+  html { background: var(--color-canvas); }
+  body {
+    background: var(--color-surface);
+    color: var(--color-ink);
+    font-family: var(--font-serif);
+    min-height: 100vh;
+  }
+  :focus-visible { outline: 2px solid var(--color-hold); outline-offset: 2px; }
+}

@@ -1,0 +1,33 @@
+# PostgreSQL 16 dan Redis 7 untuk Tugas Akhir. Hanya bisa diakses dari 127.0.0.1.
+# Butuh file .env di folder yang sama dengan variabel DB_PASSWORD.
+# Folder ./migrations (001_init.sql, 002_cache_read_tokens.sql) dijalankan otomatis
+# HANYA saat database masih kosong (pertama kali dibuat).
+services:
+  postgres:
+    image: postgres:16
+    container_name: ta_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ta_user
+      POSTGRES_DB: ta_db
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ta_pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ta_user -d ta_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: ta_redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+
+volumes:
+  ta_pgdata:

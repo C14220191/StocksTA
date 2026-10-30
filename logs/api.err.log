@@ -1,0 +1,23 @@
+INFO:     Started server process [30824]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:ta-ai:api_calls=2 total_tokens=4977
+INFO:ta-ai:api_calls=2 total_tokens=5006
+INFO:ta-ai:api_calls=2 total_tokens=5029
+INFO:ta-ai:api_calls=2 total_tokens=5035
+INFO:ta-ai:api_calls=2 total_tokens=4918
+INFO:ta-ai:api_calls=2 total_tokens=4941
+INFO:ta-ai:api_calls=2 total_tokens=4921
+INFO:ta-ai:api_calls=2 total_tokens=5017
+INFO:ta-ai:api_calls=2 total_tokens=4899
+INFO:ta-ai:api_calls=2 total_tokens=4937
+INFO:ta-ai:api_calls=2 total_tokens=4876
+INFO:ta-ai:api_calls=2 total_tokens=5012
+INFO:ta-ai:api_calls=2 total_tokens=4925
+INFO:ta-ai:api_calls=2 total_tokens=5020
+WARNING:ta-ai:support/resistance dibuang karena tidak valid: 5000.0 / 4950.0 (close 4940.0)
+INFO:ta-ai:api_calls=2 total_tokens=4915
+INFO:ta-ai:api_calls=2 total_tokens=4908
+INFO:ta-ai:api_calls=2 total_tokens=4971
+INFO:ta-ai:api_calls=2 total_tokens=4971
