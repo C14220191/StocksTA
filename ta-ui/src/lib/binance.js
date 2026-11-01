@@ -1,8 +1,26 @@
-// Data real-time kripto langsung dari Binance (public market data, tanpa API key).
+// Data real-time instrument Binance langsung dari browser (public market data, tanpa API key).
 // Hanya untuk tampilan: tidak melewati backend, cache, maupun AI, jadi tidak memengaruhi
 // pengukuran latency / token cost di inference_log.
-const WS_BASE = (import.meta.env.VITE_BINANCE_WS_URL || "wss://stream.binance.com:9443").replace(/\/$/, "");
-const REST_BASE = (import.meta.env.VITE_BINANCE_REST_URL || "https://api.binance.com").replace(/\/$/, "");
+//
+// market = "spot" (kripto, source binance) atau "futures" (USDⓈ-M, source binance_futures, mis. XAUUSDT).
+const trim = (u) => u.replace(/\/$/, "");
+const ENDPOINTS = {
+  spot: {
+    ws: trim(import.meta.env.VITE_BINANCE_WS_URL || "wss://stream.binance.com:9443"),
+    klines: trim(import.meta.env.VITE_BINANCE_REST_URL || "https://api.binance.com") + "/api/v3/klines",
+  },
+  futures: {
+    ws: trim(import.meta.env.VITE_BINANCE_FUTURES_WS_URL || "wss://fstream.binance.com"),
+    klines: trim(import.meta.env.VITE_BINANCE_FUTURES_REST_URL || "https://fapi.binance.com") + "/fapi/v1/klines",
+  },
+};
+
+// source backend (kolom `source` di respons instrument) -> market Binance; null = tidak ada data live (saham).
+export function liveMarket(source) {
+  if (source === "binance") return "spot";
+  if (source === "binance_futures") return "futures";
+  return null;
+}
 
 // Interval candle yang didukung UI = interval bawaan Binance, jadi nama `tf` backend bisa dipakai langsung.
 export const TF_SECONDS = { "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "1d": 86400 };
@@ -50,8 +68,8 @@ function connect(url, { onOpen, onMessage, onStatus }) {
 }
 
 // Candle berjalan satu simbol. onKline menerima field `k` dari event kline.
-export function connectKline(symbol, interval, { onKline, onOpen, onStatus }) {
-  return connect(`${WS_BASE}/ws/${symbol.toLowerCase()}@kline_${interval}`, {
+export function connectKline(symbol, interval, { market = "spot", onKline, onOpen, onStatus }) {
+  return connect(`${ENDPOINTS[market].ws}/ws/${symbol.toLowerCase()}@kline_${interval}`, {
     onOpen,
     onStatus,
     onMessage: (msg) => {
@@ -62,9 +80,9 @@ export function connectKline(symbol, interval, { onKline, onOpen, onStatus }) {
 }
 
 // Harga terakhir beberapa simbol sekaligus (satu koneksi, stream miniTicker ~1 pesan/detik/simbol).
-export function connectTickers(symbols, { onPrice, onStatus }) {
+export function connectTickers(symbols, { market = "spot", onPrice, onStatus }) {
   const streams = symbols.map((s) => `${s.toLowerCase()}@miniTicker`).join("/");
-  return connect(`${WS_BASE}/stream?streams=${streams}`, {
+  return connect(`${ENDPOINTS[market].ws}/stream?streams=${streams}`, {
     onStatus,
     onMessage: (msg) => {
       const d = msg?.data;
@@ -74,8 +92,8 @@ export function connectTickers(symbols, { onPrice, onStatus }) {
 }
 
 // Candle dari startMs sampai sekarang (maks 1000). Dipakai untuk menambal candle yang terlewat.
-export async function fetchKlines(symbol, interval, startMs, signal) {
-  const url = new URL(`${REST_BASE}/api/v3/klines`);
+export async function fetchKlines(symbol, interval, startMs, signal, market = "spot") {
+  const url = new URL(ENDPOINTS[market].klines);
   url.search = new URLSearchParams({
     symbol: symbol.toUpperCase(),
     interval,

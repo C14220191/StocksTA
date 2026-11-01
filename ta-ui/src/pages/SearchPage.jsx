@@ -24,7 +24,7 @@ export default function SearchPage() {
       <p className="mt-1 text-xs text-muted">
         {term
           ? "Pilih instrumen untuk melihat grafik dan ringkasan analisis AI"
-          : "Ketik kode saham IDX atau pasangan kripto di kotak pencarian di atas, lalu tekan Enter"}
+          : "Ketik kode saham IDX, pasangan kripto, atau komoditas (mis. XAU) di kotak pencarian di atas, lalu tekan Enter"}
       </p>
 
       {term && data && (

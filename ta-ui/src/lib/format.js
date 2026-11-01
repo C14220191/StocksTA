@@ -127,4 +127,5 @@ export function ageSecondsFromIso(iso) {
   return Number.isNaN(t) ? null : (Date.now() - t) / 1000;
 }
 
-export const assetLabel = (type) => (type === "stock" ? "Saham IDX" : type === "crypto" ? "Kripto" : "");
+const ASSET_LABEL = { stock: "Saham IDX", crypto: "Kripto", commodity: "Komoditas" };
+export const assetLabel = (type) => ASSET_LABEL[type] ?? "";

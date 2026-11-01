@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
-import { connectTickers } from "./binance.js";
+import { connectTickers, liveMarket } from "./binance.js";
 
-// Harga live untuk baris-baris kripto di tabel (Home, Search). Saham tidak punya WebSocket gratis,
-// jadi barisnya dibiarkan apa adanya.
+// Harga live untuk baris-baris Binance di tabel (Home, Search): kripto (spot) dan komoditas
+// seperti XAUUSDT (futures). Saham tidak punya WebSocket gratis, jadi barisnya dibiarkan apa adanya.
 //
 // Perubahan % tetap memakai definisi backend (terhadap penutupan harian sebelumnya): penutupan
 // sebelumnya diturunkan dari harga dan change_pct backend, lalu dipakai untuk menghitung ulang
 // dengan harga live.
 export default function useLivePrices(rows) {
-  const symbols = [
-    ...new Set((rows ?? []).filter((r) => r?.asset_type === "crypto").map((r) => r.symbol)),
-  ].sort();
-  const key = symbols.join(",");
+  // "spot:BTCUSDT,ETHUSDT|futures:XAUUSDT" - satu koneksi per market
+  const groups = {};
+  for (const r of rows ?? []) {
+    const market = liveMarket(r?.source);
+    if (market) (groups[market] ??= new Set()).add(r.symbol);
+  }
+  const key = Object.keys(groups)
+    .sort()
+    .map((m) => `${m}:${[...groups[m]].sort().join(",")}`)
+    .join("|");
 
   const [prices, setPrices] = useState({});
   const [status, setStatus] = useState("connecting");
@@ -19,11 +25,21 @@ export default function useLivePrices(rows) {
   useEffect(() => {
     if (!key) return;
     let buffer = {};
-    const stop = connectTickers(key.split(","), {
-      onPrice: (symbol, price) => {
-        buffer[symbol] = price;
-      },
-      onStatus: setStatus,
+    const statuses = {};
+    const stops = key.split("|").map((part) => {
+      const [market, list] = part.split(":");
+      return connectTickers(list.split(","), {
+        market,
+        onPrice: (symbol, price) => {
+          buffer[symbol] = price;
+        },
+        onStatus: (s) => {
+          // Badge "live" hanya kalau semua koneksi tersambung
+          statuses[market] = s;
+          const all = Object.values(statuses);
+          setStatus(all.every((x) => x === "live") ? "live" : all.includes("offline") ? "offline" : "connecting");
+        },
+      });
     });
     // Render paling cepat 1x per detik, bukan setiap pesan
     const timer = setInterval(() => {
@@ -34,7 +50,7 @@ export default function useLivePrices(rows) {
       }
     }, 1000);
     return () => {
-      stop();
+      stops.forEach((stop) => stop());
       clearInterval(timer);
     };
   }, [key]);
@@ -42,7 +58,7 @@ export default function useLivePrices(rows) {
   const apply = useCallback(
     (row) => {
       const live = prices[row?.symbol];
-      if (row?.asset_type !== "crypto" || live == null) return row;
+      if (!liveMarket(row?.source) || live == null) return row;
       const out = { ...row, price: live };
       if (row.change_pct != null && row.change_pct > -100) {
         const prevClose = row.price / (1 + row.change_pct / 100);

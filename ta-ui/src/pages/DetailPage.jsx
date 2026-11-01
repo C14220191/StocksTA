@@ -6,6 +6,7 @@ import IndicatorPicker from "../components/IndicatorPicker.jsx";
 import LiveBadge from "../components/LiveBadge.jsx";
 import useApi from "../lib/useApi.js";
 import { analyzeSymbol, getCandles, getInstrument } from "../lib/api.js";
+import { liveMarket } from "../lib/binance.js";
 import {
   ageSecondsFromIso,
   assetLabel,
@@ -207,9 +208,9 @@ export default function DetailPage({ symbol }) {
   const currency = inst?.currency;
   const price = (v) => formatPrice(v, currency, { short: true });
 
-  // Kripto: harga dan candle terakhir diperbarui real-time dari Binance. Saham: dari data ingestion backend.
-  const isCrypto = inst?.asset_type === "crypto";
-  const live = isCrypto && candles.data ? { symbol: inst.symbol, interval: candles.data.timeframe } : null;
+  // Kripto dan komoditas Binance: harga dan candle terakhir real-time (spot / futures). Saham: data ingestion backend.
+  const market = liveMarket(inst?.source);
+  const live = market && candles.data ? { symbol: inst.symbol, interval: candles.data.timeframe, market } : null;
   const shownPrice = livePrice ?? inst?.price;
   const prevClose = inst?.change_pct != null && inst.change_pct > -100 ? inst.price / (1 + inst.change_pct / 100) : null;
   const shownChange = livePrice != null && prevClose ? (livePrice / prevClose - 1) * 100 : inst?.change_pct;
@@ -227,7 +228,7 @@ export default function DetailPage({ symbol }) {
         <div className="mt-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 font-sans">
           <span className="text-2xl font-semibold">{formatPrice(shownPrice, currency)}</span>
           <span className={`text-sm font-semibold ${changeClass(shownChange)}`}>{formatChange(shownChange)}</span>
-          {isCrypto ? (
+          {market ? (
             <LiveBadge status={liveStatus ?? "connecting"} />
           ) : (
             <span className="text-xs text-muted">

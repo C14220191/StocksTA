@@ -68,7 +68,7 @@ function addSeries(chart, spec, ser, pane) {
  * Props
  *  data      respons /candles (candles + timeframe). Indikator dihitung di sini, bukan memakai data.indicators.
  *  active    Set id indikator (lihat lib/indicators.js)
- *  live      { symbol, interval } untuk update real-time dari Binance, atau null
+ *  live      { symbol, interval, market } untuk update real-time dari Binance (market spot/futures), atau null
  *  onPrice   dipanggil dengan harga terakhir setiap ada tick live
  *  onStatus  dipanggil dengan "connecting" | "live" | "offline" (null saat live dihentikan)
  */
@@ -204,7 +204,7 @@ export default function PriceChart({ data, active, assetType, currency, live, on
   //    dari array candle yang sama, sehingga RSI/MACD/EMA/dst ikut bergerak.
   useEffect(() => {
     if (!live || !hasCandles) return;
-    const { symbol, interval } = live;
+    const { symbol, interval, market } = live;
     const step = TF_SECONDS[interval];
     let stopped = false;
     let busy = false; // selama sinkronisasi REST berjalan, pesan WebSocket diabaikan
@@ -233,7 +233,7 @@ export default function PriceChart({ data, active, assetType, currency, live, on
       if (!m || busy) return;
       busy = true;
       try {
-        const fresh = await fetchKlines(symbol, interval, m.candles[m.candles.length - 1].time * 1000);
+        const fresh = await fetchKlines(symbol, interval, m.candles[m.candles.length - 1].time * 1000, undefined, market);
         if (stopped || modelRef.current !== m || !fresh.length) return;
         m.candles = mergeCandles(m.candles, fresh);
         redraw(true);
@@ -262,6 +262,7 @@ export default function PriceChart({ data, active, assetType, currency, live, on
     };
 
     const stop = connectKline(symbol, interval, {
+      market,
       onOpen: sync,
       onStatus: (s) => cb.current.onStatus?.(s),
       onKline,
@@ -271,7 +272,7 @@ export default function PriceChart({ data, active, assetType, currency, live, on
       stop();
       cb.current.onStatus?.(null);
     };
-  }, [live?.symbol, live?.interval, data, hasCandles]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [live?.symbol, live?.interval, live?.market, data, hasCandles]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 3) Khusus development: bandingkan indikator hitungan browser dengan data.indicators dari backend,
   //    supaya terlihat apakah rumusnya sama. Lihat tab Console di DevTools.

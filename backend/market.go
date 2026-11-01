@@ -23,7 +23,8 @@ type MarketRow struct {
 	Symbol        string     `json:"symbol"`         // dipakai untuk URL, mis. "BTCUSDT", "BBCA.JK"
 	DisplaySymbol string     `json:"display_symbol"` // untuk tampilan, mis. "BTC/USDT", "BBCA"
 	Name          string     `json:"name"`
-	AssetType     string     `json:"asset_type"` // stock | crypto
+	AssetType     string     `json:"asset_type"` // stock | crypto | commodity
+	Source        string     `json:"source"`     // yahoo | binance | binance_futures (UI memilih stream live dari sini)
 	Currency      string     `json:"currency"`   // IDR | USD
 	Price         float64    `json:"price"`
 	PriceTS       time.Time  `json:"price_ts"`         // waktu buka candle 1h terakhir yang dipakai sebagai harga
@@ -62,7 +63,7 @@ sig AS (
     FROM ai_summaries
     ORDER BY instrument_id, generated_at DESC
 )
-SELECT i.symbol, coalesce(i.name, ''), i.asset_type,
+SELECT i.symbol, coalesce(i.name, ''), i.asset_type, i.source,
        l.close::float8, l.ts, l.fetched_at,
        r.ref_close::float8, v.volume_24h, v.turnover_24h,
        s.signal, s.generated_at
@@ -76,7 +77,7 @@ WHERE ($1::text = '' OR i.asset_type = $1::text)
   AND ($3::text = '' OR i.symbol = $3::text)
 ORDER BY i.symbol`
 
-// MarketRows: assetType ("" | stock | crypto), query (pencarian bebas), exact (satu symbol persis).
+// MarketRows: assetType ("" | stock | crypto | commodity), query (pencarian bebas), exact (satu symbol persis).
 func (s *Store) MarketRows(ctx context.Context, assetType, query, exact string) ([]MarketRow, error) {
 	rows, err := s.pool.Query(ctx, marketSQL, assetType, query, exact)
 	if err != nil {
@@ -88,7 +89,7 @@ func (s *Store) MarketRows(ctx context.Context, assetType, query, exact string) 
 	for rows.Next() {
 		var r MarketRow
 		var ref *float64
-		if err := rows.Scan(&r.Symbol, &r.Name, &r.AssetType,
+		if err := rows.Scan(&r.Symbol, &r.Name, &r.AssetType, &r.Source,
 			&r.Price, &r.PriceTS, &r.FetchedAt,
 			&ref, &r.Volume24h, &r.Turnover24h,
 			&r.Signal, &r.SignalAt); err != nil {
@@ -112,7 +113,7 @@ func (s *Store) MarketRows(ctx context.Context, assetType, query, exact string) 
 }
 
 func displayOf(symbol, assetType string) (display, currency string) {
-	if assetType == "crypto" {
+	if assetType == "crypto" || assetType == "commodity" {
 		for _, q := range []string{"USDT", "USDC", "BUSD"} {
 			if strings.HasSuffix(symbol, q) && len(symbol) > len(q) {
 				return strings.TrimSuffix(symbol, q) + "/" + q, "USD"
@@ -196,11 +197,11 @@ func (s *Store) LatestSummary(ctx context.Context, instID int) (*StoredSummary, 
 
 // ---- handlers ----
 
-// GET /api/market/overview?type=all|stock|crypto&limit=5&movers=3
+// GET /api/market/overview?type=all|stock|crypto|commodity&limit=5&movers=3
 func (a *App) MarketOverview(c echo.Context) error {
 	assetType, ok := parseAssetType(c.QueryParam("type"))
 	if !ok {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "type harus all, stock, atau crypto"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "type harus all, stock, crypto, atau commodity"})
 	}
 	limit := queryInt(c, "limit", 10, 1, 50)
 	movers := queryInt(c, "movers", 3, 1, 20)
@@ -237,12 +238,12 @@ func (a *App) MarketOverview(c echo.Context) error {
 	})
 }
 
-// GET /api/search?q=antm&type=all|stock|crypto
+// GET /api/search?q=antm&type=all|stock|crypto|commodity
 func (a *App) Search(c echo.Context) error {
 	q := strings.TrimSpace(c.QueryParam("q"))
 	assetType, ok := parseAssetType(c.QueryParam("type"))
 	if !ok {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "type harus all, stock, atau crypto"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "type harus all, stock, crypto, atau commodity"})
 	}
 	if len(q) > 40 {
 		q = q[:40]
@@ -504,6 +505,8 @@ func parseAssetType(s string) (string, bool) {
 		return "stock", true
 	case "crypto", "kripto":
 		return "crypto", true
+	case "commodity", "komoditas":
+		return "commodity", true
 	}
 	return "", false
 }

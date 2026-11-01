@@ -11,6 +11,7 @@ const TABS = [
   { key: "all", label: "Semua" },
   { key: "stock", label: "Saham (IDX)" },
   { key: "crypto", label: "Kripto" },
+  { key: "commodity", label: "Komoditas" },
 ];
 
 const TOP_VOLUME_LIMIT = 10;
@@ -30,7 +31,7 @@ export default function HomePage() {
   return (
     <div>
       <h1 className="text-xl font-bold">Beranda</h1>
-      <p className="mt-1 text-xs text-muted">Ringkasan pasar saham IDX dan Kripto hari ini</p>
+      <p className="mt-1 text-xs text-muted">Ringkasan pasar saham IDX, kripto, dan komoditas hari ini</p>
 
       <div role="tablist" className="mt-5 inline-flex border border-line p-1">
         {TABS.map((t) => (

@@ -71,8 +71,14 @@ func TestRealizedVolatility(t *testing.T) {
 }
 
 func TestTickerURL(t *testing.T) {
-	got := tickerURL("https://data-api.binance.vision/api/v3/klines")
-	if got != "https://data-api.binance.vision/api/v3/ticker/price" {
-		t.Errorf("tickerURL = %s", got)
+	cases := map[string]string{
+		"https://data-api.binance.vision/api/v3/klines": "https://data-api.binance.vision/api/v3/ticker/price",
+		"https://fapi.binance.com/fapi/v1/klines":       "https://fapi.binance.com/fapi/v1/ticker/price",
+		"bukan-url-binance":                             "default",
+	}
+	for in, want := range cases {
+		if got := tickerURL(in, "default"); got != want {
+			t.Errorf("tickerURL(%s) = %s, mau %s", in, got, want)
+		}
 	}
 }

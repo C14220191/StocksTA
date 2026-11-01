@@ -48,7 +48,7 @@ export default function Header() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Escape" && setInput("")}
-            placeholder="Cari saham atau kripto, tekan Enter"
+            placeholder="Cari saham, kripto, atau emas, tekan Enter"
             aria-label="Cari instrumen"
             enterKeyHint="search"
             className="w-full border border-line bg-panel py-2 pl-11 pr-4 text-lg font-bold outline-none transition-colors placeholder:text-sm placeholder:font-normal placeholder:text-muted hover:border-line-strong focus:border-line-strong"

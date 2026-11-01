@@ -51,11 +51,15 @@ func main() {
 	// metrik freshness berbasis harga diukur dengan cara yang sama di setiap kondisi.
 	var prices *PriceFeed
 	if env("PRICE_FEED", "on") == "on" {
-		syms, err := store.SymbolsBySource(ctx, "binance")
+		spot, err := store.SymbolsBySource(ctx, "binance")
 		if err != nil {
 			log.Fatalf("baca instrument binance: %v", err)
 		}
-		prices = NewPriceFeed(syms)
+		futures, err := store.SymbolsBySource(ctx, "binance_futures")
+		if err != nil {
+			log.Fatalf("baca instrument binance_futures: %v", err)
+		}
+		prices = NewPriceFeed(spot, futures)
 		go prices.Run(ctx)
 	}
 

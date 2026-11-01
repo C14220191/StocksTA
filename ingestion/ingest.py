@@ -6,7 +6,10 @@ Pemakaian:
     python ingestion/ingest.py --timeframe 1h --backfill   # isi ulang sekitar 1 tahun (jalankan sekali)
     python ingestion/ingest.py --timeframe 1d --backfill
 
-Perlu environment: DATABASE_URL, dan opsional BINANCE_URL.
+Instrument yang diambil = isi tabel instruments (kolom source: yahoo | binance | binance_futures),
+jadi menambah instrument cukup lewat migrasi/INSERT, tanpa mengubah file ini.
+
+Perlu environment: DATABASE_URL, dan opsional BINANCE_URL, BINANCE_FUTURES_URL.
     pip install yfinance psycopg2-binary requests
 """
 import argparse
@@ -24,18 +27,12 @@ from urllib3.util.retry import Retry
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BINANCE_URL = os.environ.get("BINANCE_URL", "https://api.binance.com/api/v3/klines")
 # Kalau api.binance.com diblokir (HTTP 451), set BINANCE_URL=https://data-api.binance.vision/api/v3/klines
+# USDⓈ-M Futures (mis. XAUUSDT). Tidak punya mirror data-api; kalau diblokir di lokasi server, instrument ini gagal.
+BINANCE_FUTURES_URL = os.environ.get("BINANCE_FUTURES_URL", "https://fapi.binance.com/fapi/v1/klines")
 
 SESSION = requests.Session()
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(
     total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])))
-
-INSTRUMENTS = [
-    ("BBCA.JK", "yahoo"),
-    ("BBRI.JK", "yahoo"),
-    ("TLKM.JK", "yahoo"),
-    ("BTCUSDT", "binance"),
-    ("ETHUSDT", "binance"),
-]
 
 INTERVAL_MS = {"1h": 3_600_000, "1d": 86_400_000}
 YAHOO_PERIOD_BACKFILL = {"1h": "1y", "1d": "1y"}
@@ -61,16 +58,16 @@ WHERE ohlcv.fetched_at < ohlcv.ts + interval '{interval}'
 """
 
 
-def _binance_page(symbol, timeframe, limit, start_ms=None):
+def _binance_page(url, symbol, timeframe, limit, start_ms=None):
     params = {"symbol": symbol, "interval": timeframe, "limit": limit}
     if start_ms is not None:
         params["startTime"] = start_ms
-    r = SESSION.get(BINANCE_URL, params=params, timeout=20)
+    r = SESSION.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-def fetch_binance(symbol, timeframe, since=None):
+def fetch_binance(symbol, timeframe, since=None, url=BINANCE_URL):
     """Kembalikan list (ts_utc, open, high, low, close, volume). ts = waktu BUKA candle.
     since = ts candle terakhir di DB (ikut diambil ulang karena mungkin masih berjalan);
     None = backfill sekitar 1 tahun."""
@@ -81,7 +78,7 @@ def fetch_binance(symbol, timeframe, since=None):
     start = int(since.timestamp() * 1000)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     while start <= now_ms:
-        page = _binance_page(symbol, timeframe, 1000, start)
+        page = _binance_page(url, symbol, timeframe, 1000, start)
         if not page:
             break
         pages.append(page)
@@ -130,20 +127,25 @@ def main():
         sys.exit("DATABASE_URL belum di-set")
     conn = psycopg2.connect(DATABASE_URL)
     with conn, conn.cursor() as cur:
-        cur.execute("SELECT symbol, id FROM instruments")
-        ids = dict(cur.fetchall())
+        cur.execute("SELECT symbol, source, id FROM instruments ORDER BY id")
+        instruments = cur.fetchall()
         cur.execute("SELECT instrument_id, max(ts) FROM ohlcv WHERE timeframe = %s GROUP BY 1",
                     (args.timeframe,))
         last_ts = dict(cur.fetchall())
     upsert = UPSERT_SQL.format(interval=INTERVAL_SQL[args.timeframe])
 
-    for symbol, source in INSTRUMENTS:
+    fetchers = {
+        "yahoo": fetch_yahoo,
+        "binance": fetch_binance,
+        "binance_futures": lambda *a: fetch_binance(*a, url=BINANCE_FUTURES_URL),
+    }
+    for symbol, source, inst_id in instruments:
         try:
-            if symbol not in ids:
-                raise RuntimeError("instrument belum ada di tabel instruments")
-            since = None if args.backfill else last_ts.get(ids[symbol])
-            rows = (fetch_binance if source == "binance" else fetch_yahoo)(symbol, args.timeframe, since)
-            values = [(ids[symbol], args.timeframe, *r) for r in rows]
+            if source not in fetchers:
+                raise RuntimeError(f"source {source!r} tidak dikenal")
+            since = None if args.backfill else last_ts.get(inst_id)
+            rows = fetchers[source](symbol, args.timeframe, since)
+            values = [(inst_id, args.timeframe, *r) for r in rows]
             with conn, conn.cursor() as cur:
                 execute_values(cur, upsert, values,
                                template="(%s, %s, %s, %s, %s, %s, %s, %s, now())", page_size=1000)

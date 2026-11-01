@@ -4,13 +4,13 @@ Base URL: `http://127.0.0.1:8080`. Semua endpoint `GET`, JSON.
 
 | Halaman | Endpoint | Memanggil AI? | Dicatat di `inference_log`? |
 |---|---|---|---|
-| Home | `/api/market/overview?type=all\|stock\|crypto&limit=10&movers=3` | Tidak | Tidak |
-| Search | `/api/search?q=<teks>&type=all\|stock\|crypto` | Tidak | Tidak |
+| Home | `/api/market/overview?type=all\|stock\|crypto\|commodity&limit=10&movers=3` | Tidak | Tidak |
+| Search | `/api/search?q=<teks>&type=all\|stock\|crypto\|commodity` | Tidak | Tidak |
 | Detail (header + kartu statistik) | `/api/instruments/:symbol` | Tidak | Tidak |
 | Detail (grafik + indikator) | `/api/instruments/:symbol/candles?range=1D\|1W\|1M\|3M\|6M\|1Y\|ALL&tf=1h\|2h\|4h\|6h\|1d` | Tidak | Tidak |
 | Detail ("Ringkasan analisis AI") | `/api/analyze/:symbol` | Ya, kalau MISS | **Ya** |
 
-`type` juga menerima `semua`, `saham`, `kripto`. `:symbol` memakai `symbol` dari respons (mis. `BTCUSDT`, `BBCA.JK`), bukan `display_symbol`.
+`type` juga menerima `semua`, `saham`, `kripto`, `komoditas`. `:symbol` memakai `symbol` dari respons (mis. `BTCUSDT`, `BBCA.JK`), bukan `display_symbol`.
 
 ## Satu baris instrument (dipakai Home dan Search)
 
@@ -20,6 +20,7 @@ Base URL: `http://127.0.0.1:8080`. Semua endpoint `GET`, JSON.
   "display_symbol": "BTC/USDT",
   "name": "Bitcoin",
   "asset_type": "crypto",
+  "source": "binance",
   "currency": "USD",
   "price": 82267.17,
   "price_ts": "2026-10-29T09:00:00Z",
@@ -36,6 +37,8 @@ Base URL: `http://127.0.0.1:8080`. Semua endpoint `GET`, JSON.
 | Kolom mockup | Field |
 |---|---|
 | Instrumen (judul / subjudul) | `display_symbol` / `name` |
+| Kategori | `asset_type`: `stock` / `crypto` / `commodity` |
+| Sumber data live | `source`: `binance` (spot WebSocket), `binance_futures` (futures WebSocket, mis. XAUUSDT), `yahoo` (tidak live) |
 | Harga | `price` + `currency` (format dengan `formatPrice`) |
 | Perubahan | `change_pct` (terhadap penutupan harian sebelumnya; `null` kalau belum ada) |
 | Volume | `volume_24h` (lembar / koin) atau `turnover_24h` (nilai transaksi) |
