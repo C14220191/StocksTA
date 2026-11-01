@@ -150,3 +150,18 @@ Header opsional `X-TA-Trigger: ui | k6 | scheduled | manual` (default `ui`) mena
 ## CORS
 
 Origin yang diizinkan diatur `CORS_ORIGINS` di `run.env` (default `http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000`).
+
+## Admin (`/admin` di UI)
+
+Tanpa autentikasi: backend hanya listen di `127.0.0.1`, akses dari mesin yang sama atau lewat SSH tunnel.
+
+| Halaman | Endpoint | Isi |
+|---|---|---|
+| Dashboard | `GET /api/admin/overview?period=24h\|7d\|30d&trigger=all\|ui\|k6\|scheduled\|manual` | Biaya, token, penghematan cache (estimasi HIT × rata-rata token per panggilan AI), latensi p50/p95, kunjungan, request per jam/hari (WIB), instrumen teratas |
+| Prompt | `GET /api/admin/prompt?symbol=BTCUSDT` | Prompt aktif dirender dengan data terkini lewat `POST /prompt/preview` di AI service (tanpa memanggil model), riwayat versi prompt + akurasi backtest |
+| Cache & Job | `GET /api/admin/cache` | Status cache per instrumen (Redis + sisa TTL + deviasi harga), invalidasi terakhir, job terjadwal dari `job_runs`, antrean Hermes |
+| Cache & Job | `POST /api/admin/cache/:symbol/invalidate` | Buang cache satu instrumen, dicatat di `cache_events` dengan reason `manual` |
+| Evaluasi | `GET /api/admin/evaluation?days=30&trigger=all\|k6\|ui\|pilot\|manual&prompt=current\|stub\|all` | Metrik Bab 2.7 per kondisi × θ × pregen: H, latency p50/p95/p99, N_gen, N_pre, S, W, D_serve, SSR (θ_s 1/2/5/10), SFR, L_inv + akurasi backtest |
+| API Health | `GET /api/admin/health` | PostgreSQL, Redis, AI service, price feed spot/futures, ingestion per sumber, log kesalahan 7 hari |
+
+`job_runs` (migrasi 006) diisi oleh `ingest.py` dan `backtest.py`, satu baris per job per instrumen.

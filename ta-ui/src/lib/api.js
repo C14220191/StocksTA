@@ -15,7 +15,7 @@ const STATUS_MESSAGE = {
   422: "Data harga untuk instrumen ini belum tersedia.",
 };
 
-async function get(path, params = {}, signal) {
+async function request(method, path, params = {}, signal) {
   const url = new URL(BASE + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
@@ -23,7 +23,7 @@ async function get(path, params = {}, signal) {
 
   let res;
   try {
-    res = await fetch(url, { signal });
+    res = await fetch(url, { method, signal });
   } catch (e) {
     if (e.name === "AbortError") throw e;
     throw new ApiError(
@@ -44,6 +44,7 @@ async function get(path, params = {}, signal) {
   return res.json();
 }
 
+const get = (path, params, signal) => request("GET", path, params, signal);
 const sym = (s) => encodeURIComponent(s);
 
 // type: "all" | "stock" | "crypto"
@@ -71,3 +72,13 @@ export function analyzeSymbol(symbol) {
   inflight.set(symbol, p);
   return p;
 }
+
+// ---- Admin (/admin) ----
+// period: 24h|7d|30d, trigger: all|ui|k6|scheduled|manual
+export const getAdminOverview = (params, signal) => get("/api/admin/overview", params, signal);
+export const getAdminCache = (signal) => get("/api/admin/cache", {}, signal);
+export const getAdminPrompt = (symbol, signal) => get("/api/admin/prompt", { symbol }, signal);
+// days, trigger, prompt: current|all
+export const getAdminEvaluation = (params, signal) => get("/api/admin/evaluation", params, signal);
+export const getAdminHealth = (signal) => get("/api/admin/health", {}, signal);
+export const invalidateCache = (symbol) => request("POST", `/api/admin/cache/${sym(symbol)}/invalidate`);

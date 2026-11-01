@@ -9,7 +9,7 @@ Konfigurasi lewat environment (diisi dari run.env):
     HERMES_TIMEOUT          default 120 (detik, per proses Hermes)
     HERMES_MAX_CONCURRENCY  default 1 (jumlah proses Hermes yang boleh jalan bersamaan)
     HERMES_QUEUE_TIMEOUT    default 180 (detik maksimal menunggu giliran; lewat -> 503)
-    PROMPT_VERSION          default "hermes-v3" (naikkan setiap prompt diubah)
+    PROMPT_VERSION          default "hermes-v4" (naikkan setiap prompt diubah)
     PRICE_IN_PER_M, PRICE_OUT_PER_M, PRICE_CACHE_READ_PER_M
                             harga resmi model (USD per juta token). Kalau salah satunya > 0,
                             cost_usd dihitung sendiri (biaya setara); kalau semuanya 0,
@@ -37,7 +37,7 @@ HERMES_REASONING = os.environ.get("HERMES_REASONING", "none")
 HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT", "120"))
 MAX_CONCURRENCY = int(os.environ.get("HERMES_MAX_CONCURRENCY", "1"))
 QUEUE_TIMEOUT = int(os.environ.get("HERMES_QUEUE_TIMEOUT", "180"))
-PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "hermes-v3")
+PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "hermes-v4")
 PRICE_IN = float(os.environ.get("PRICE_IN_PER_M", "0") or 0)
 PRICE_OUT = float(os.environ.get("PRICE_OUT_PER_M", "0") or 0)
 PRICE_CACHE = float(os.environ.get("PRICE_CACHE_READ_PER_M", "0") or 0)
@@ -47,6 +47,15 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="TA AI service", version="0.1.0")
 _sem = threading.BoundedSemaphore(MAX_CONCURRENCY)
+# Statistik antrean untuk /health (halaman admin): berapa proses Hermes sedang jalan / menunggu.
+_stats_lock = threading.Lock()
+_stats = {"running": 0, "waiting": 0, "completed": 0, "failed": 0, "rejected": 0}
+
+
+def _bump(**delta):
+    with _stats_lock:
+        for k, v in delta.items():
+            _stats[k] += v
 
 
 class CandleIn(BaseModel):
@@ -65,6 +74,24 @@ class AnalyzeRequest(BaseModel):
     # Harga terkini (price feed / close terbaru) saat request; None = tidak dikirim backend.
     last_price: float | None = None
     last_price_ts: str | None = None
+    # Indikator teknikal yang dihitung backend dari candle 1h tertutup (Bab 3.3.1).
+    indicators: dict[str, float | None] | None = None
+
+
+# Urutan dan label indikator di prompt. Nilai None (data belum cukup) dilewati.
+INDICATOR_LABELS = [
+    ("rsi14", "RSI(14)"), ("ema20", "EMA(20)"), ("ema50", "EMA(50)"),
+    ("macd", "MACD(12,26)"), ("macd_signal", "sinyal MACD(9)"), ("macd_hist", "histogram MACD"),
+    ("bb_lower", "Bollinger(20,2) bawah"), ("bb_middle", "Bollinger tengah"), ("bb_upper", "Bollinger atas"),
+    ("stoch_k", "Stochastic %K(14)"), ("stoch_d", "Stochastic %D(3)"),
+]
+
+
+def format_indicators(ind: dict | None) -> str:
+    if not ind:
+        return ""
+    parts = [f"{label}={ind[k]:.6g}" for k, label in INDICATOR_LABELS if ind.get(k) is not None]
+    return ("Indikator pada candle terakhir yang sudah tutup: " + ", ".join(parts) + ". ") if parts else ""
 
 
 def build_prompt(req: AnalyzeRequest) -> str:
@@ -82,10 +109,12 @@ def build_prompt(req: AnalyzeRequest) -> str:
     return (
         f"Kamu analis pasar. Instrument: {req.symbol}, timeframe {req.timeframe}, "
         f"{len(req.candles)} candle terakhir (waktu UTC, format O/H/L/C/V): {rows}. "
+        f"{format_indicators(req.indicators)}"
         f"{live}"
         "Analisis hanya berdasarkan data tersebut. "
         "Balas HANYA dengan satu objek JSON valid, tanpa teks lain dan tanpa markdown, "
-        "dengan kunci: summary (ringkasan analisis teknikal Bahasa Indonesia, maksimal 80 kata), "
+        "dengan kunci: summary (ringkasan analisis teknikal deskriptif Bahasa Indonesia tentang tren, "
+        "momentum, dan kondisi overbought/oversold, bukan perintah transaksi, maksimal 80 kata), "
         "signal (salah satu dari BUY, SELL, HOLD), "
         "support (angka, level support terdekat), resistance (angka, level resistance terdekat). "
         "Angka support dan resistance ditulis polos tanpa pemisah ribuan, titik untuk desimal."
@@ -194,17 +223,25 @@ def equivalent_cost(tokens_in: int, tokens_out: int, cache_read: int, reported: 
 def run_hermes(prompt: str, last_close: float) -> dict:
     # Antrean dibatasi waktunya supaya saat load test (k6) request tidak menumpuk tanpa batas.
     t0 = time.monotonic()
-    if not _sem.acquire(timeout=QUEUE_TIMEOUT):
+    _bump(waiting=1)
+    got = _sem.acquire(timeout=QUEUE_TIMEOUT)
+    _bump(waiting=-1)
+    if not got:
+        _bump(rejected=1)
         raise HTTPException(503, f"antrean Hermes penuh lebih dari {QUEUE_TIMEOUT} detik")
     queue_ms = int((time.monotonic() - t0) * 1000)
+    _bump(running=1)
+    ok = False
     try:
         t1 = time.monotonic()
         out = _run_hermes(prompt, last_close)
         out["exec_ms"] = int((time.monotonic() - t1) * 1000)
         out["queue_ms"] = queue_ms
+        ok = True
         return out
     finally:
         _sem.release()
+        _bump(running=-1, completed=1 if ok else 0, failed=0 if ok else 1)
 
 
 def _run_hermes(prompt: str, last_close: float) -> dict:
@@ -270,6 +307,32 @@ def health():
         "toolsets": HERMES_TOOLSETS,
         "reasoning": HERMES_REASONING,
         "max_concurrency": MAX_CONCURRENCY,
+        "queue_timeout": QUEUE_TIMEOUT,
+        "timeout": HERMES_TIMEOUT,
+        "queue": dict(_stats),  # sejak service start
+    }
+
+
+# Variabel yang diisi ke template prompt (untuk ditampilkan di halaman admin Prompt Editor).
+PROMPT_VARIABLES = [
+    {"name": "symbol", "desc": "Kode instrument, mis. BTCUSDT"},
+    {"name": "timeframe", "desc": "Selalu 1h untuk analisis"},
+    {"name": "candles", "desc": "14 candle 1h terakhir yang sudah tutup, format waktu-UTC O/H/L/C/V"},
+    {"name": "last_price", "desc": "Harga terkini dari price feed (atau close 1h terbaru untuk saham)"},
+    {"name": "last_price_ts", "desc": "Waktu harga terkini (UTC)"},
+    {"name": "indicators", "desc": "RSI(14), EMA(20/50), MACD(12,26,9), Bollinger(20,2), Stochastic(14,3) dari candle tertutup, dihitung backend"},
+]
+
+
+@app.post("/prompt/preview")
+def prompt_preview(req: AnalyzeRequest):
+    """Render prompt persis seperti yang akan dikirim ke Hermes, TANPA memanggil model (tanpa token)."""
+    prompt = build_prompt(req)
+    return {
+        "prompt_version": PROMPT_VERSION,
+        "prompt": prompt,
+        "chars": len(prompt),
+        "variables": PROMPT_VARIABLES,
     }
 
 

@@ -49,6 +49,27 @@ type InferenceLog struct {
 	AIExecMS          *int
 	AIFormatOK        *bool
 	Error             string
+
+	Pregen            bool
+	StateAtGeneration string
+	StateAtRequest    string
+	StateChanged      *bool
+}
+
+// CacheEvent: satu invalidation (tabel cache_events). L_inv = waktu dicatat - CrossedAt.
+type CacheEvent struct {
+	InstrumentID int
+	Reason       string // price_move | state_change | manual
+	ChangePct    *float64
+	Condition    string
+	Threshold    *float64
+	Pregen       bool
+	SummaryID    *int64
+	DetectedBy   string // watcher | request | scheduler | admin
+	CrossedAt    *time.Time
+	LatencyMS    *float64
+	StateFrom    string
+	StateTo      string
 }
 
 type Store struct {
@@ -106,8 +127,24 @@ func (s *Store) LatestCandles(ctx context.Context, instID int, timeframe string,
 }
 
 // InsertSummary menyimpan hasil AI dan mengembalikan id serta generated_at.
-func (s *Store) InsertSummary(ctx context.Context, instID int, sourceTS time.Time,
-	pv, model, content, signal string, priceAtGen float64, support, resistance *float64) (int64, time.Time, error) {
+// NewSummary: satu hasil AI yang akan disimpan ke ai_summaries.
+type NewSummary struct {
+	InstrumentID   int
+	SourceTS       time.Time
+	PromptVersion  string
+	Model, Content string
+	Signal         string
+	PriceAtGen     float64
+	Support        *float64
+	Resistance     *float64
+	Origin         string // ondemand | pregen
+	State          string
+	Indicators     *IndicatorSnapshot
+}
+
+func (s *Store) InsertSummary(ctx context.Context, n NewSummary) (int64, time.Time, error) {
+	instID, sourceTS, pv, model, content, signal := n.InstrumentID, n.SourceTS, n.PromptVersion, n.Model, n.Content, n.Signal
+	priceAtGen, support, resistance := n.PriceAtGen, n.Support, n.Resistance
 
 	var sig any // nil -> NULL (tabel hanya menerima BUY, SELL, HOLD)
 	switch signal {
@@ -118,10 +155,12 @@ func (s *Store) InsertSummary(ctx context.Context, instID int, sourceTS time.Tim
 	var genAt time.Time
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO ai_summaries
-		    (instrument_id, source_data_ts, prompt_version, model, content, signal, price_at_generation, support, resistance)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		    (instrument_id, source_data_ts, prompt_version, model, content, signal, price_at_generation,
+		     support, resistance, origin, state_at_generation, indicators)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), $12)
 		RETURNING id, generated_at`,
-		instID, sourceTS, pv, model, content, sig, priceAtGen, support, resistance).Scan(&id, &genAt)
+		instID, sourceTS, pv, model, content, sig, priceAtGen, support, resistance,
+		n.Origin, n.State, n.Indicators).Scan(&id, &genAt)
 	return id, genAt, err
 }
 
@@ -133,23 +172,30 @@ func (s *Store) LogInference(ctx context.Context, l InferenceLog) error {
 		     data_age_seconds, ttl_applied_seconds, realized_volatility,
 		     trigger, prompt_version, invalidation_threshold_pct, summary_id,
 		     price_at_generation, price_at_request, price_source, price_deviation_pct,
-		     cache_age_seconds, ai_queue_ms, ai_exec_ms, ai_format_ok, error)
+		     cache_age_seconds, ai_queue_ms, ai_exec_ms, ai_format_ok, error,
+		     pregen, state_at_generation, state_at_request, state_changed)
 		VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, $12,
 		        $13, NULLIF($14, ''), $15, $16, $17, $18, NULLIF($19, ''), $20,
-		        $21, $22, $23, $24, NULLIF($25, ''))`,
+		        $21, $22, $23, $24, NULLIF($25, ''),
+		        $26, NULLIF($27, ''), NULLIF($28, ''), $29)`,
 		l.InstrumentID, l.Condition, l.CacheStatus, l.LatencyMS,
 		l.Model, l.TokensIn, l.TokensOut, l.CacheReadTokens, l.CostUSD,
 		l.DataAgeSeconds, l.TTLSeconds, l.Volatility,
 		l.Trigger, l.PromptVersion, l.Threshold, l.SummaryID,
 		l.PriceAtGeneration, l.PriceAtRequest, l.PriceSource, l.PriceDeviationPct,
-		l.CacheAgeSeconds, l.AIQueueMS, l.AIExecMS, l.AIFormatOK, l.Error)
+		l.CacheAgeSeconds, l.AIQueueMS, l.AIExecMS, l.AIFormatOK, l.Error,
+		l.Pregen, l.StateAtGeneration, l.StateAtRequest, l.StateChanged)
 	return err
 }
 
-func (s *Store) LogCacheEvent(ctx context.Context, instID int, reason string, changePct float64) error {
+func (s *Store) LogCacheEvent(ctx context.Context, e CacheEvent) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO cache_events (instrument_id, reason, price_change_pct) VALUES ($1, $2, $3)`,
-		instID, reason, changePct)
+		INSERT INTO cache_events
+		    (instrument_id, reason, price_change_pct, experiment_condition, invalidation_threshold_pct, pregen,
+		     summary_id, detected_by, crossed_at, invalidation_latency_ms, state_from, state_to)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), NULLIF($12, ''))`,
+		e.InstrumentID, e.Reason, e.ChangePct, e.Condition, e.Threshold, e.Pregen,
+		e.SummaryID, e.DetectedBy, e.CrossedAt, e.LatencyMS, e.StateFrom, e.StateTo)
 	return err
 }
 
@@ -167,9 +213,9 @@ func (s *Store) LatestPrice(ctx context.Context, instID int) (Quote, error) {
 	return q, err
 }
 
-// SigmaRef menghitung σ_ref per symbol: persentil p dari realized volatility rolling
-// (window n candle 1h yang sudah tutup) selama 1 tahun terakhir.
-func (s *Store) SigmaRef(ctx context.Context, n int, p float64) (map[string]float64, error) {
+// SigmaRef menghitung σ_ref per symbol dari realized volatility rolling (window n candle 1h
+// yang sudah tutup) selama 1 tahun terakhir. stat: "mean" (rata-rata historis, Bab 3) atau "pNN".
+func (s *Store) SigmaRef(ctx context.Context, n int, stat string) (map[string]float64, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT i.symbol, o.close::float8
 		FROM ohlcv o JOIN instruments i ON i.id = o.instrument_id
@@ -199,7 +245,11 @@ func (s *Store) SigmaRef(ctx context.Context, n int, p float64) (map[string]floa
 			vols = append(vols, realizedVolatility(cs[i-n:i]))
 		}
 		sort.Float64s(vols)
-		out[sym] = percentile(vols, p)
+		v, err := sigmaRefStat(vols, stat)
+		if err != nil {
+			return nil, err
+		}
+		out[sym] = v
 	}
 	return out, nil
 }

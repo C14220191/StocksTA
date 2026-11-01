@@ -8,29 +8,42 @@ import (
 	"log/slog"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// CachedSummary adalah hasil AI inference yang disimpan di cache.
+// CachedSummary adalah hasil AI inference yang disimpan di cache. Seperti Cortex (Ruan et al., 2026),
+// setiap entri membawa metadata performanya sendiri: token, biaya, harga, dan waktu generate.
 type CachedSummary struct {
 	SummaryID         int64
+	InstrumentID      int
 	Content           string
 	Signal            string
 	Model             string
 	PromptVersion     string
+	Origin            string    // ondemand | pregen (Lapis 2 / Lapis 1)
 	SourceDataTS      time.Time // ts candle terakhir yang dipakai saat summary dibuat
 	GeneratedAt       time.Time
-	PriceAtGeneration float64  // harga terkini yang dilihat AI (dasar event invalidation)
+	PriceAtGeneration float64  // P_gen: harga terkini yang dilihat AI (dasar event invalidation)
+	State             string   // S_gen: vektor kondisi indikator saat generate
 	Support           *float64 // level dari AI
 	Resistance        *float64 // level dari AI
+	TokensIn          int
+	TokensOut         int
+	CostUSD           float64
 }
 
-// Invalidation menjelaskan kenapa entry cache dibuang saat Get (dicatat ke cache_events).
+// Invalidation menjelaskan kenapa entry cache dibuang (dicatat ke cache_events).
 type Invalidation struct {
-	Reason    string  // "price_move"
-	ChangePct float64 // bertanda
+	Reason       string  // price_move | state_change | manual
+	ChangePct    float64 // drift harga bertanda, (P / P_gen - 1) x 100
+	StateFrom    string
+	StateTo      string
+	SummaryID    int64
+	InstrumentID int
+	CrossedAt    *time.Time // t_crossing; nil kalau tidak diketahui (mis. pemeriksaan saat request)
 }
 
 // CachePolicy adalah satu-satunya titik yang berbeda antar kondisi eksperimen.
@@ -39,33 +52,84 @@ type Invalidation struct {
 type CachePolicy interface {
 	// Name dipakai sebagai experiment_condition di inference_log.
 	Name() string
-	// Threshold: ambang event invalidation (persen), nil kalau kondisi ini tidak memakainya.
+	// Threshold: ambang event invalidation θ (persen), nil kalau kondisi ini tidak memakainya.
 	Threshold() *float64
-	// Get mengembalikan summary kalau HIT. Kalau entry ada tapi dibuang karena event,
-	// summary nil dan inv terisi.
-	Get(ctx context.Context, symbol string, price float64) (s *CachedSummary, inv *Invalidation)
+	// Get mengembalikan summary kalau HIT. Kalau entry ada tapi tidak lolos pemeriksaan
+	// (drift harga >= θ atau S berubah), entry dibuang, summary nil dan inv terisi.
+	Get(ctx context.Context, symbol string, price float64, state string) (s *CachedSummary, inv *Invalidation)
 	// Set mengembalikan TTL yang diterapkan (detik), nil kalau tidak ada TTL.
 	Set(ctx context.Context, symbol string, s CachedSummary, volatility float64) *int
 	Ping(ctx context.Context) error
+	// Inspect membaca entry tanpa efek samping (halaman admin). ttl < 0 = tanpa kedaluwarsa.
+	Inspect(ctx context.Context, symbol string) (s *CachedSummary, ttl time.Duration, err error)
+	// Invalidate membuang entry secara manual; true kalau memang ada yang dibuang.
+	Invalidate(ctx context.Context, symbol string) (bool, error)
+}
+
+// policyConfig: kondisi eksperimen satu instance.
+type policyConfig struct {
+	mode       string
+	threshold  float64 // θ; 0 = tanpa event invalidation
+	checkState bool    // pemeriksaan ketiga (S berubah)
+	pregen     bool
+}
+
+// instanceKey membedakan entri Redis antar instance yang berjalan paralel (live paralel),
+// mis. "hybrid-2-pg" = hybrid, θ 2%, dengan pre-generation.
+func (c policyConfig) instanceKey() string {
+	k := c.mode
+	if c.threshold > 0 {
+		k += "-" + strconv.FormatFloat(c.threshold, 'f', -1, 64)
+	}
+	if c.pregen {
+		k += "-pg"
+	}
+	return k
+}
+
+func loadPolicyConfig() (policyConfig, error) {
+	c := policyConfig{mode: env("CACHE_MODE", "no_cache"), pregen: env("PREGEN", "off") == "on"}
+	switch c.mode {
+	case "no_cache", "static_ttl", "dynamic_ttl", "event_only", "hybrid":
+	default:
+		return c, fmt.Errorf("CACHE_MODE %q tidak dikenal", c.mode)
+	}
+	if c.mode == "event_only" || c.mode == "hybrid" {
+		th, err := strconv.ParseFloat(env("INVALIDATION_THRESHOLD_PCT", "2"), 64)
+		if err != nil || th <= 0 {
+			return c, fmt.Errorf("INVALIDATION_THRESHOLD_PCT tidak valid")
+		}
+		c.threshold = th
+		// Bab 3.3.3: pada kondisi yang hanya menguji TTL, pemeriksaan harga dan S dinonaktifkan.
+		c.checkState = env("INVALIDATE_ON_STATE", "on") == "on"
+	}
+	if c.pregen && c.mode == "no_cache" {
+		return c, fmt.Errorf("PREGEN=on butuh CACHE_MODE dengan cache (bukan no_cache)")
+	}
+	return c, nil
 }
 
 // NewPolicy sengaja gagal untuk mode yang tidak dikenal,
 // supaya eksperimen tidak diam-diam berjalan dengan kondisi yang salah.
-func NewPolicy(ctx context.Context, mode string, store *Store) (CachePolicy, error) {
-	if mode == "no_cache" {
+func NewPolicy(ctx context.Context, cfg policyConfig, store *Store) (CachePolicy, error) {
+	if cfg.mode == "no_cache" {
 		return NoCache{}, nil
 	}
 
-	p := &RedisPolicy{name: mode, version: env("PROMPT_VERSION", promptVersion)}
-	switch mode {
+	base, err := envSeconds("TTL_BASE_SECONDS", envInt("STATIC_TTL_SECONDS", 3600))
+	if err != nil {
+		return nil, err
+	}
+	p := &RedisPolicy{
+		name: cfg.mode, prefix: cfg.instanceKey(), version: env("PROMPT_VERSION", promptVersion),
+		threshold: cfg.threshold, checkState: cfg.checkState,
+	}
+	switch cfg.mode {
 	case "static_ttl":
-		sec, err := envSeconds("STATIC_TTL_SECONDS", 3600)
-		if err != nil {
-			return nil, err
-		}
-		p.ttl = func(string, float64) time.Duration { return sec }
+		// TTL statis (pembanding): TTL = TTL_base untuk semua instrument.
+		p.ttl = func(string, float64) time.Duration { return base }
 	case "dynamic_ttl", "hybrid":
-		dt, err := newDynamicTTL(ctx, store)
+		dt, err := newDynamicTTL(ctx, store, base)
 		if err != nil {
 			return nil, err
 		}
@@ -77,15 +141,6 @@ func NewPolicy(ctx context.Context, mode string, store *Store) (CachePolicy, err
 			return nil, err
 		}
 		p.ttl = func(string, float64) time.Duration { return sec }
-	default:
-		return nil, fmt.Errorf("CACHE_MODE %q tidak dikenal", mode)
-	}
-	if mode == "event_only" || mode == "hybrid" {
-		th, err := strconv.ParseFloat(env("INVALIDATION_THRESHOLD_PCT", "2"), 64)
-		if err != nil || th <= 0 {
-			return nil, fmt.Errorf("INVALIDATION_THRESHOLD_PCT tidak valid")
-		}
-		p.threshold = th
 	}
 
 	rdb, err := newRedis()
@@ -94,6 +149,13 @@ func NewPolicy(ctx context.Context, mode string, store *Store) (CachePolicy, err
 	}
 	p.rdb = rdb
 	return p, nil
+}
+
+func envInt(key string, def int) int {
+	if v, err := strconv.Atoi(env(key, "")); err == nil {
+		return v
+	}
+	return def
 }
 
 func envSeconds(key string, def int) (time.Duration, error) {
@@ -121,22 +183,32 @@ func (NoCache) Name() string                                             { retur
 func (NoCache) Threshold() *float64                                      { return nil }
 func (NoCache) Ping(context.Context) error                               { return nil }
 func (NoCache) Set(context.Context, string, CachedSummary, float64) *int { return nil }
-func (NoCache) Get(context.Context, string, float64) (*CachedSummary, *Invalidation) {
+func (NoCache) Inspect(context.Context, string) (*CachedSummary, time.Duration, error) {
+	return nil, 0, nil
+}
+func (NoCache) Invalidate(context.Context, string) (bool, error) { return false, nil }
+func (NoCache) Get(context.Context, string, float64, string) (*CachedSummary, *Invalidation) {
 	return nil, nil
 }
 
-// RedisPolicy dipakai oleh empat kondisi cache. Perbedaannya hanya di fungsi TTL dan ambang event:
+// RedisPolicy dipakai oleh empat kondisi cache. Perbedaannya hanya di fungsi TTL dan pemeriksaan:
 //
-//	static_ttl  : TTL tetap,     tanpa event
-//	dynamic_ttl : TTL adaptif,   tanpa event
-//	event_only  : TTL pengaman,  dengan event
-//	hybrid      : TTL adaptif,   dengan event
+//	static_ttl  : TTL = TTL_base,  tanpa pemeriksaan harga / S
+//	dynamic_ttl : TTL adaptif,     tanpa pemeriksaan harga / S
+//	event_only  : TTL pengaman,    drift harga >= θ atau S berubah -> dibuang
+//	hybrid      : TTL adaptif,     drift harga >= θ atau S berubah -> dibuang
+//
+// Pemeriksaan harga/S dijalankan di dua tempat: proaktif oleh watcher di setiap tick (L_inv),
+// dan saat Get sebagai pengaman (mis. saham yang harganya hanya berubah per jam).
 type RedisPolicy struct {
-	name      string
-	version   string // prompt_version, bagian dari key supaya summary prompt lama tidak terpakai
-	rdb       *redis.Client
-	ttl       func(symbol string, volatility float64) time.Duration
-	threshold float64 // persen; 0 = tanpa event invalidation
+	name       string
+	prefix     string // instanceKey, supaya instance paralel tidak berbagi entri
+	version    string // prompt_version, bagian dari key supaya summary prompt lama tidak terpakai
+	rdb        *redis.Client
+	ttl        func(symbol string, volatility float64) time.Duration
+	threshold  float64 // persen; 0 = tanpa event invalidation
+	checkState bool
+	watcher    *Watcher // nil kalau kondisi tanpa event invalidation
 }
 
 func (p *RedisPolicy) Name() string { return p.name }
@@ -151,10 +223,26 @@ func (p *RedisPolicy) Threshold() *float64 {
 func (p *RedisPolicy) Ping(ctx context.Context) error { return p.rdb.Ping(ctx).Err() }
 
 func (p *RedisPolicy) key(symbol string) string {
-	return "ta:summary:" + p.version + ":" + symbol + ":" + analysisTimeframe
+	return "ta:summary:" + p.prefix + ":" + p.version + ":" + symbol + ":" + analysisTimeframe
 }
 
-func (p *RedisPolicy) Get(ctx context.Context, symbol string, price float64) (*CachedSummary, *Invalidation) {
+// stale menilai pemeriksaan kedua dan ketiga (Gambar 3.4). nil = masih valid.
+func (p *RedisPolicy) stale(s *CachedSummary, price float64, state string) *Invalidation {
+	if p.threshold <= 0 {
+		return nil
+	}
+	if dev, ok := priceDeviationPct(s.PriceAtGeneration, price); ok && math.Abs(dev) >= p.threshold {
+		return &Invalidation{Reason: "price_move", ChangePct: dev, SummaryID: s.SummaryID, InstrumentID: s.InstrumentID}
+	}
+	if p.checkState && s.State != "" && state != "" && s.State != state {
+		dev, _ := priceDeviationPct(s.PriceAtGeneration, price)
+		return &Invalidation{Reason: "state_change", ChangePct: dev, StateFrom: s.State, StateTo: state,
+			SummaryID: s.SummaryID, InstrumentID: s.InstrumentID}
+	}
+	return nil
+}
+
+func (p *RedisPolicy) Get(ctx context.Context, symbol string, price float64, state string) (*CachedSummary, *Invalidation) {
 	b, err := p.rdb.Get(ctx, p.key(symbol)).Bytes()
 	if err != nil {
 		if !errors.Is(err, redis.Nil) {
@@ -167,21 +255,54 @@ func (p *RedisPolicy) Get(ctx context.Context, symbol string, price float64) (*C
 		slog.Error("cache rusak, dianggap miss", "err", err)
 		return nil, nil
 	}
-	if p.threshold > 0 {
-		if dev, ok := priceDeviationPct(s.PriceAtGeneration, price); ok && math.Abs(dev) >= p.threshold {
-			// DEL mengembalikan 1 hanya untuk request yang benar-benar membuang entry,
-			// jadi request bersamaan tidak mencatat event yang sama berkali-kali.
-			n, err := p.rdb.Del(ctx, p.key(symbol)).Result()
-			if err != nil {
-				slog.Error("redis del gagal", "err", err)
+	if inv := p.stale(&s, price, state); inv != nil {
+		// DEL mengembalikan 1 hanya untuk pemanggil yang benar-benar membuang entry (watcher atau
+		// request lain bisa lebih dulu), jadi event yang sama tidak tercatat dua kali.
+		if removed, _ := p.delIf(ctx, symbol, s.SummaryID); removed {
+			if p.watcher != nil {
+				p.watcher.Untrack(symbol)
 			}
-			if n == 1 {
-				return nil, &Invalidation{Reason: "price_move", ChangePct: dev}
-			}
-			return nil, nil
+			return nil, inv
 		}
+		return nil, nil
 	}
 	return &s, nil
+}
+
+func (p *RedisPolicy) del(ctx context.Context, symbol string) (bool, error) {
+	n, err := p.rdb.Del(ctx, p.key(symbol)).Result()
+	if err != nil {
+		slog.Error("redis del gagal", "err", err)
+	}
+	if n == 1 && p.watcher != nil {
+		p.watcher.Untrack(symbol)
+	}
+	return n == 1, err
+}
+
+func (p *RedisPolicy) Inspect(ctx context.Context, symbol string) (*CachedSummary, time.Duration, error) {
+	pipe := p.rdb.Pipeline()
+	get := pipe.Get(ctx, p.key(symbol))
+	ttl := pipe.PTTL(ctx, p.key(symbol))
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, 0, err
+	}
+	b, err := get.Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	var s CachedSummary
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, 0, err
+	}
+	return &s, ttl.Val(), nil
+}
+
+func (p *RedisPolicy) Invalidate(ctx context.Context, symbol string) (bool, error) {
+	return p.del(ctx, symbol)
 }
 
 func (p *RedisPolicy) Set(ctx context.Context, symbol string, s CachedSummary, vol float64) *int {
@@ -193,6 +314,9 @@ func (p *RedisPolicy) Set(ctx context.Context, symbol string, s CachedSummary, v
 	if err := p.rdb.Set(ctx, p.key(symbol), b, ttl).Err(); err != nil {
 		slog.Error("redis set gagal", "err", err)
 		return nil
+	}
+	if p.watcher != nil {
+		p.watcher.Track(symbol, s, time.Now().Add(ttl))
 	}
 	sec := int(ttl.Seconds())
 	return &sec
@@ -208,51 +332,73 @@ func priceDeviationPct(atGen, now float64) (float64, bool) {
 
 // ---- dynamic TTL ----
 
-// DynamicTTL: TTL = TTL_max - norm * (TTL_max - TTL_min), norm = clamp(σ / σ_ref, 0, 1).
+// DynamicTTL (Bab 2.5): TTL = clamp(TTL_base / (1 + k * σ / σ_ref), TTL_min, TTL_max).
 // σ = realized volatility 14 candle 1h terakhir (sama dengan realizedVolatility di handler),
-// σ_ref = persentil ke-90 σ historis instrument itu (rolling window 14 candle, 1 tahun).
-// Volatilitas tinggi -> TTL pendek (summary cepat basi), pasar tenang -> TTL panjang.
+// σ_ref = volatilitas acuan per instrument dari data historis 1 tahun (default: rata-rata σ
+// rolling window 14). Volatilitas tinggi -> TTL pendek, pasar tenang -> TTL mendekati TTL_base.
 type DynamicTTL struct {
-	min, max time.Duration
-	ref      map[string]float64 // symbol -> σ_ref
+	base, min, max time.Duration
+	k              float64
+	ref            map[string]float64 // symbol -> σ_ref
 }
 
-func newDynamicTTL(ctx context.Context, store *Store) (*DynamicTTL, error) {
+func newDynamicTTL(ctx context.Context, store *Store, base time.Duration) (*DynamicTTL, error) {
 	minTTL, err := envSeconds("DYNAMIC_TTL_MIN_SECONDS", 300)
 	if err != nil {
 		return nil, err
 	}
-	maxTTL, err := envSeconds("DYNAMIC_TTL_MAX_SECONDS", 3600)
+	maxTTL, err := envSeconds("DYNAMIC_TTL_MAX_SECONDS", int(base.Seconds()))
 	if err != nil {
 		return nil, err
 	}
 	if minTTL > maxTTL {
 		return nil, fmt.Errorf("DYNAMIC_TTL_MIN_SECONDS > DYNAMIC_TTL_MAX_SECONDS")
 	}
-	pct, err := strconv.ParseFloat(env("SIGMA_REF_PERCENTILE", "90"), 64)
-	if err != nil || pct <= 0 || pct > 100 {
-		return nil, fmt.Errorf("SIGMA_REF_PERCENTILE tidak valid")
+	k, err := strconv.ParseFloat(env("DYNAMIC_TTL_K", "1"), 64)
+	if err != nil || k < 0 {
+		return nil, fmt.Errorf("DYNAMIC_TTL_K tidak valid")
 	}
-	ref, err := store.SigmaRef(ctx, analysisCandles, pct/100)
+	stat := env("SIGMA_REF_STAT", "mean")
+	ref, err := store.SigmaRef(ctx, analysisCandles, stat)
 	if err != nil {
 		return nil, fmt.Errorf("hitung sigma_ref: %w", err)
 	}
-	// Dicatat di log supaya nilai parameter bisa ditulis di Metodologi.
-	slog.Info("dynamic TTL", "ttl_min", minTTL, "ttl_max", maxTTL, "percentile", pct, "sigma_ref", ref)
-	return &DynamicTTL{min: minTTL, max: maxTTL, ref: ref}, nil
+	// Dicatat di log supaya nilai parameter bisa ditulis di Metodologi (Tabel parameter).
+	slog.Info("dynamic TTL", "ttl_base", base, "k", k, "ttl_min", minTTL, "ttl_max", maxTTL,
+		"sigma_ref_stat", stat, "sigma_ref", ref)
+	return &DynamicTTL{base: base, min: minTTL, max: maxTTL, k: k, ref: ref}, nil
 }
 
 func (d *DynamicTTL) TTL(symbol string, vol float64) time.Duration {
-	return dynamicTTL(vol, d.ref[symbol], d.min, d.max)
+	return dynamicTTL(vol, d.ref[symbol], d.base, d.k, d.min, d.max)
 }
 
-func dynamicTTL(vol, ref float64, minTTL, maxTTL time.Duration) time.Duration {
+func dynamicTTL(vol, ref float64, base time.Duration, k float64, minTTL, maxTTL time.Duration) time.Duration {
 	if ref <= 0 {
 		return minTTL // σ_ref tidak diketahui: pilih yang paling aman untuk freshness
 	}
-	norm := math.Min(math.Max(vol/ref, 0), 1)
-	ttl := maxTTL - time.Duration(norm*float64(maxTTL-minTTL))
-	return ttl.Round(time.Second)
+	ttl := time.Duration(float64(base) / (1 + k*math.Max(vol, 0)/ref))
+	return min(max(ttl, minTTL), maxTTL).Round(time.Second)
+}
+
+// sigmaRefStat: "mean" atau persentil "pNN" (mis. p90) dari kumpulan σ yang sudah terurut naik.
+func sigmaRefStat(sorted []float64, stat string) (float64, error) {
+	if len(sorted) == 0 {
+		return 0, nil
+	}
+	if stat == "mean" {
+		var s float64
+		for _, v := range sorted {
+			s += v
+		}
+		return s / float64(len(sorted)), nil
+	}
+	if strings.HasPrefix(stat, "p") {
+		if q, err := strconv.ParseFloat(stat[1:], 64); err == nil && q > 0 && q <= 100 {
+			return percentile(sorted, q/100), nil
+		}
+	}
+	return 0, fmt.Errorf("SIGMA_REF_STAT %q tidak valid (mean atau pNN)", stat)
 }
 
 // percentile dengan interpolasi linear; v harus sudah terurut naik.

@@ -117,6 +117,18 @@ def fetch_yahoo(symbol, timeframe, since=None):
     return rows
 
 
+def log_job(conn, job, target, started_at, status, rows=0, message=None):
+    """Catat ke job_runs (dibaca halaman admin). Gagal mencatat tidak menggagalkan ingestion."""
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_runs (job, target, started_at, status, rows, message) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (job, target, started_at, status, rows, (message or "")[:500] or None))
+    except Exception as e:  # mis. migrasi 006 belum dijalankan
+        print(f"[warn] gagal mencatat job_runs: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--timeframe", choices=["1h", "1d"], required=True)
@@ -139,7 +151,9 @@ def main():
         "binance": fetch_binance,
         "binance_futures": lambda *a: fetch_binance(*a, url=BINANCE_FUTURES_URL),
     }
+    job = f"ingest_{args.timeframe}"
     for symbol, source, inst_id in instruments:
+        started = datetime.now(timezone.utc)
         try:
             if source not in fetchers:
                 raise RuntimeError(f"source {source!r} tidak dikenal")
@@ -151,8 +165,10 @@ def main():
                                template="(%s, %s, %s, %s, %s, %s, %s, %s, now())", page_size=1000)
             mode = "backfill" if since is None else f"sejak {since:%Y-%m-%d %H:%M}"
             print(f"[ok]   {symbol} ({source}) {args.timeframe}: {len(rows)} candle ({mode})")
+            log_job(conn, job, symbol, started, "ok", len(rows), mode)
         except Exception as e:  # satu instrument gagal tidak menghentikan yang lain
             print(f"[fail] {symbol}: {e}")
+            log_job(conn, job, symbol, started, "fail", 0, str(e))
     conn.close()
 
 

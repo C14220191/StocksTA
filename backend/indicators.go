@@ -133,6 +133,60 @@ func bollinger(v []float64, p int, k float64) (upper, middle, lower []float64) {
 	return upper, middle, lower
 }
 
+// stochastic: %K = (close - lowest low p) / (highest high p - lowest low p) x 100, %D = SMA d dari %K.
+func stochastic(high, low, close []float64, p, d int) (k, dLine []float64) {
+	k = nanSeries(len(close))
+	for i := p - 1; i < len(close) && p > 0; i++ {
+		hh, ll := high[i], low[i]
+		for j := i - p + 1; j <= i; j++ {
+			hh, ll = math.Max(hh, high[j]), math.Min(ll, low[j])
+		}
+		if hh > ll {
+			k[i] = (close[i] - ll) / (hh - ll) * 100
+		} else {
+			k[i] = 50 // rentang nol: posisi di tengah
+		}
+	}
+	dLine = nanSeries(len(close))
+	for i := range close {
+		if i >= p-1+d-1 {
+			var s float64
+			for j := i - d + 1; j <= i; j++ {
+				s += k[j]
+			}
+			dLine[i] = s / float64(d)
+		}
+	}
+	return k, dLine
+}
+
+// rsiWilderState: rata-rata gain/loss Wilder setelah nilai terakhir, supaya RSI bisa dihitung
+// untuk satu close tambahan tanpa mengulang seluruh deret (dipakai vektor kondisi S).
+func rsiWilderState(v []float64, p int) (avgGain, avgLoss float64, ok bool) {
+	if p <= 0 || len(v) <= p {
+		return 0, 0, false
+	}
+	for i := 1; i <= p; i++ {
+		if d := v[i] - v[i-1]; d > 0 {
+			avgGain += d
+		} else {
+			avgLoss -= d
+		}
+	}
+	avgGain, avgLoss = avgGain/float64(p), avgLoss/float64(p)
+	for i := p + 1; i < len(v); i++ {
+		g, l := 0.0, 0.0
+		if d := v[i] - v[i-1]; d > 0 {
+			g = d
+		} else {
+			l = -d
+		}
+		avgGain = (avgGain*float64(p-1) + g) / float64(p)
+		avgLoss = (avgLoss*float64(p-1) + l) / float64(p)
+	}
+	return avgGain, avgLoss, true
+}
+
 func nanSeries(n int) []float64 {
 	out := make([]float64, n)
 	for i := range out {

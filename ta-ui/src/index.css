@@ -15,6 +15,14 @@
   --color-down: #ff5a5f;         /* turun / Sell */
   --color-hold: #f5a524;         /* Hold / chip aktif */
 
+  /* Admin: seri chart (palet kategorikal, divalidasi untuk permukaan gelap panel #131a28)
+     dan status (selalu dipasangkan dengan ikon + label, tidak dipakai untuk seri). */
+  --color-series-1: #3987e5;     /* cache HIT */
+  --color-series-2: #d95926;     /* panggilan AI */
+  --color-status-good: #0ca30c;
+  --color-status-warning: #fab219;
+  --color-status-critical: #d03b3b;
+
   --font-serif: "Newsreader", Georgia, serif;
   --font-sans: "Inter", system-ui, sans-serif;
 }

@@ -8,6 +8,7 @@ __pycache__/
 
 # Go: hasil build
 backend/*.exe
+backend/*.exe~
 
 # Log dan PID dari ta-up.ps1
 logs/

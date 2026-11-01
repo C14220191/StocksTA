@@ -10,7 +10,8 @@ const ENDPOINTS = {
     klines: trim(import.meta.env.VITE_BINANCE_REST_URL || "https://api.binance.com") + "/api/v3/klines",
   },
   futures: {
-    ws: trim(import.meta.env.VITE_BINANCE_FUTURES_WS_URL || "wss://fstream.binance.com"),
+    // kline/miniTicker futures hanya dikirim lewat path /market (path lama tersambung tapi tanpa data)
+    ws: trim(import.meta.env.VITE_BINANCE_FUTURES_WS_URL || "wss://fstream.binance.com/market"),
     klines: trim(import.meta.env.VITE_BINANCE_FUTURES_REST_URL || "https://fapi.binance.com") + "/fapi/v1/klines",
   },
 };

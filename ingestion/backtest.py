@@ -18,6 +18,7 @@ Perlu environment: DATABASE_URL. Aman dijalankan berulang (hanya baris yang masi
 import argparse
 import os
 import sys
+from datetime import datetime, timezone
 
 import psycopg2
 
@@ -62,6 +63,17 @@ GROUP BY 1, 2 ORDER BY 1, 2
 """
 
 
+def log_job(conn, started_at, status, rows, message):
+    """Catat ke job_runs (dibaca halaman admin). Gagal mencatat tidak menggagalkan backtest."""
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO job_runs (job, started_at, status, rows, message) VALUES ('backtest', %s, %s, %s, %s)",
+                (started_at, status, rows, message[:500]))
+    except Exception as e:  # mis. migrasi 006 belum dijalankan
+        print(f"[warn] gagal mencatat job_runs: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hold-band", type=float, default=1.0, help="lebar zona HOLD dalam persen")
@@ -69,12 +81,19 @@ def main():
     if not DATABASE_URL:
         sys.exit("DATABASE_URL belum di-set")
 
+    started = datetime.now(timezone.utc)
     conn = psycopg2.connect(DATABASE_URL)
-    with conn, conn.cursor() as cur:
-        cur.execute(UPDATE_SQL, {"band": args.hold_band})
-        print(f"[ok] {cur.rowcount} summary diisi (hold band {args.hold_band}%)")
-        cur.execute(SUMMARY_SQL)
-        rows = cur.fetchall()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(UPDATE_SQL, {"band": args.hold_band})
+            filled = cur.rowcount
+            print(f"[ok] {filled} summary diisi (hold band {args.hold_band}%)")
+            cur.execute(SUMMARY_SQL)
+            rows = cur.fetchall()
+    except Exception as e:
+        log_job(conn, started, "fail", 0, str(e))
+        raise
+    log_job(conn, started, "ok", filled, f"hold band {args.hold_band}%")
     conn.close()
 
     if rows:

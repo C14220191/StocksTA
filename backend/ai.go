@@ -39,7 +39,8 @@ type AIResult struct {
 type AIClient interface {
 	// quote = harga terkini, ikut dikirim ke prompt supaya summary mencerminkan pergerakan
 	// sejak candle terakhir tutup (penting untuk event-driven invalidation).
-	Analyze(ctx context.Context, symbol string, candles []Candle, quote Quote) (*AIResult, error)
+	// snap = indikator teknikal server-side (RSI, EMA, MACD, Bollinger, Stochastic) untuk prompt.
+	Analyze(ctx context.Context, symbol string, candles []Candle, quote Quote, snap *IndicatorSnapshot) (*AIResult, error)
 }
 
 // NewAIClient: mode "http" memanggil layanan FastAPI, selain itu memakai stub (tanpa token).
@@ -63,7 +64,7 @@ func NewAIClient(mode, url string) AIClient {
 
 type stubAI struct{ delay time.Duration }
 
-func (s *stubAI) Analyze(ctx context.Context, symbol string, candles []Candle, _ Quote) (*AIResult, error) {
+func (s *stubAI) Analyze(ctx context.Context, symbol string, candles []Candle, _ Quote, _ *IndicatorSnapshot) (*AIResult, error) {
 	select {
 	case <-time.After(s.delay):
 	case <-ctx.Done():
@@ -119,15 +120,17 @@ type aiCandle struct {
 }
 
 type aiRequest struct {
-	Symbol      string     `json:"symbol"`
-	Timeframe   string     `json:"timeframe"`
-	Candles     []aiCandle `json:"candles"`
-	LastPrice   float64    `json:"last_price,omitempty"`
-	LastPriceTS string     `json:"last_price_ts,omitempty"`
+	Symbol      string             `json:"symbol"`
+	Timeframe   string             `json:"timeframe"`
+	Candles     []aiCandle         `json:"candles"`
+	LastPrice   float64            `json:"last_price,omitempty"`
+	LastPriceTS string             `json:"last_price_ts,omitempty"`
+	Indicators  *IndicatorSnapshot `json:"indicators,omitempty"`
 }
 
-func (h *httpAI) Analyze(ctx context.Context, symbol string, candles []Candle, quote Quote) (*AIResult, error) {
-	req := aiRequest{Symbol: symbol, Timeframe: analysisTimeframe}
+// newAIRequest: payload ke AI service, sama untuk /analyze dan /prompt/preview.
+func newAIRequest(symbol string, candles []Candle, quote Quote, snap *IndicatorSnapshot) aiRequest {
+	req := aiRequest{Symbol: symbol, Timeframe: analysisTimeframe, Indicators: snap}
 	if quote.Price > 0 {
 		req.LastPrice = quote.Price
 		req.LastPriceTS = quote.TS.UTC().Format(time.RFC3339)
@@ -138,7 +141,11 @@ func (h *httpAI) Analyze(ctx context.Context, symbol string, candles []Candle, q
 			Low: c.Low, Close: c.Close, Volume: c.Volume,
 		})
 	}
-	body, err := json.Marshal(req)
+	return req
+}
+
+func (h *httpAI) Analyze(ctx context.Context, symbol string, candles []Candle, quote Quote, snap *IndicatorSnapshot) (*AIResult, error) {
+	body, err := json.Marshal(newAIRequest(symbol, candles, quote, snap))
 	if err != nil {
 		return nil, err
 	}
