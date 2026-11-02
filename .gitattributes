@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Skrip shell harus LF supaya bisa dijalankan di server Linux
+*.sh text eol=lf

@@ -1,7 +1,8 @@
 # PostgreSQL 16 dan Redis 7 untuk Tugas Akhir. Hanya bisa diakses dari 127.0.0.1.
 # Butuh file .env di folder yang sama dengan variabel DB_PASSWORD.
-# Folder ./migrations (001_init.sql, 002_cache_read_tokens.sql) dijalankan otomatis
-# HANYA saat database masih kosong (pertama kali dibuat).
+# Semua file ./migrations/*.sql (urut nama: 001, 003, ..., 008) dijalankan otomatis
+# HANYA saat volume database masih kosong (pertama kali dibuat). Database yang sudah ada:
+# jalankan file baru dengan ./ta-up.sh migrate <file> (Linux) atau .\ta-up.ps1 migrate <file> (Windows).
 services:
   postgres:
     image: postgres:16
