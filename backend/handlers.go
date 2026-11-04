@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"math"
@@ -34,12 +35,17 @@ type App struct {
 }
 
 type AnalyzeResponse struct {
-	Symbol            string    `json:"symbol"`
-	Condition         string    `json:"condition"`
-	CacheStatus       string    `json:"cache_status"`
-	Origin            string    `json:"origin"` // ondemand | pregen
-	Signal            string    `json:"signal"`
-	Summary           string    `json:"summary"`
+	Symbol            string          `json:"symbol"`
+	Method            string          `json:"method"` // debate | mtf | grounded
+	Condition         string          `json:"condition"`
+	CacheStatus       string          `json:"cache_status"`
+	Origin            string          `json:"origin"` // ondemand | pregen
+	Signal            string          `json:"signal"` // BUY | SELL | HOLD = bias bullish | bearish | neutral
+	Confidence        *int            `json:"confidence"`
+	Summary           string          `json:"summary"`
+	Detail            json.RawMessage `json:"detail"` // isi terstruktur metode; null kalau output AI bukan JSON
+	Model             string          `json:"model"`
+	FormatOK          *bool           `json:"format_ok,omitempty"` // hanya saat AI dipanggil request ini
 	LatencyMS         int64     `json:"latency_ms"`
 	TokensIn          int       `json:"tokens_in"`
 	TokensOut         int       `json:"tokens_out"`
@@ -69,6 +75,7 @@ type genOut struct {
 // genInput: semua yang dibutuhkan untuk membuat satu summary.
 type genInput struct {
 	symbol  string
+	method  string
 	instID  int
 	candles []Candle // candle 1h tertutup, lama -> baru (stateCandles)
 	quote   Quote
@@ -140,6 +147,11 @@ func (a *App) Analyze(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "format simbol tidak valid"})
 	}
 
+	method := strings.ToLower(c.QueryParam("method"))
+	if !validMethod(method) {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "method harus salah satu dari " + methodsList})
+	}
+
 	// Sumber request (header X-TA-Trigger), supaya data k6 / pilot tidak bercampur dengan UI.
 	trigger := strings.ToLower(c.Request().Header.Get("X-TA-Trigger"))
 	if trigger == "" {
@@ -162,7 +174,7 @@ func (a *App) Analyze(c echo.Context) error {
 		a.recordAccess(ctx, symbol) // popularitas untuk pre-generation (Lapis 1)
 	}
 
-	logEntry := a.baseLog(ac, trigger)
+	logEntry := a.baseLog(ac, trigger, method)
 	var (
 		status  = "MISS"
 		summary CachedSummary
@@ -172,7 +184,7 @@ func (a *App) Analyze(c echo.Context) error {
 		status = "BYPASS" // cache memang tidak dipakai di kondisi ini
 	}
 
-	if cached, inv := a.policy.Get(ctx, symbol, ac.quote.Price, ac.state); cached != nil {
+	if cached, inv := a.policy.Get(ctx, symbol, method, ac.quote.Price, ac.state); cached != nil {
 		status = "HIT"
 		summary = *cached
 	} else {
@@ -180,7 +192,7 @@ func (a *App) Analyze(c echo.Context) error {
 			a.logInvalidationFor(ctx, ac.instID, inv, "request")
 		}
 		out, led, err := a.produce(ctx, genInput{
-			symbol: symbol, instID: ac.instID, candles: ac.candles, quote: ac.quote,
+			symbol: symbol, method: method, instID: ac.instID, candles: ac.candles, quote: ac.quote,
 			vol: ac.vol, state: ac.state, origin: "ondemand",
 		})
 		if err != nil {
@@ -206,8 +218,9 @@ func (a *App) Analyze(c echo.Context) error {
 }
 
 // baseLog: kolom inference_log yang sama untuk semua status.
-func (a *App) baseLog(ac *analysisContext, trigger string) InferenceLog {
+func (a *App) baseLog(ac *analysisContext, trigger, method string) InferenceLog {
 	l := InferenceLog{
+		Method:         method,
 		InstrumentID:   ac.instID,
 		Condition:      a.policy.Name(),
 		Volatility:     ac.vol,
@@ -260,8 +273,8 @@ func (a *App) finishLog(l *InferenceLog, status string, latency time.Duration, s
 		l.PromptVersion = s.PromptVersion
 	}
 	resp := AnalyzeResponse{
-		Condition: a.policy.Name(), CacheStatus: status, Origin: s.Origin,
-		Signal: s.Signal, Summary: s.Content,
+		Method: s.Method, Condition: a.policy.Name(), CacheStatus: status, Origin: s.Origin,
+		Signal: s.Signal, Confidence: s.Confidence, Summary: s.Content, Detail: s.Detail, Model: s.Model,
 		LatencyMS: latency.Milliseconds(), DataAgeSeconds: dataAge, CacheAgeSeconds: cacheAge,
 		SourceDataTS: s.SourceDataTS, GeneratedAt: s.GeneratedAt,
 		PriceAtGeneration: s.PriceAtGeneration, PriceAtRequest: ac.quote.Price, PriceDeviationPct: devPtr,
@@ -275,18 +288,20 @@ func (a *App) finishLog(l *InferenceLog, status string, latency time.Duration, s
 		l.AIQueueMS, l.AIExecMS, l.AIFormatOK = res.QueueMS, res.ExecMS, res.FormatOK
 		resp.TokensIn, resp.TokensOut = res.TokensIn, res.TokensOut
 		resp.CacheReadTokens, resp.CostUSD = res.CacheReadTokens, res.CostUSD
+		resp.FormatOK = res.FormatOK
 	}
 	return resp
 }
 
-// produce: generate lewat singleflight (kondisi cache) supaya request bersamaan untuk simbol yang
-// sama hanya memanggil Hermes sekali (mencegah cache stampede). led = request ini yang memanggil AI.
+// produce: generate lewat singleflight (kondisi cache) supaya request bersamaan untuk simbol dan
+// metode yang sama hanya memanggil Hermes sekali (mencegah cache stampede). led = request ini yang
+// memanggil AI.
 func (a *App) produce(ctx context.Context, in genInput) (out *genOut, led bool, err error) {
 	if a.policy.Name() == "no_cache" {
 		out, err = a.generate(ctx, in)
 		return out, true, err
 	}
-	v, err, _ := a.flight.Do(in.symbol, func() (interface{}, error) {
+	v, err, _ := a.flight.Do(in.symbol+"|"+in.method, func() (interface{}, error) {
 		led = true
 		return a.generate(ctx, in)
 	})
@@ -301,15 +316,21 @@ func (a *App) generate(ctx context.Context, in genInput) (*genOut, error) {
 	gctx := context.WithoutCancel(ctx) // pembatalan satu client tidak menggagalkan yang menunggu
 	if !in.force {
 		// cek ulang: request lain mungkin baru selesai membuat summary
-		if cached, inv := a.policy.Get(gctx, in.symbol, in.quote.Price, in.state); cached != nil {
+		if cached, inv := a.policy.Get(gctx, in.symbol, in.method, in.quote.Price, in.state); cached != nil {
 			return &genOut{summary: *cached, fromCache: true}, nil
 		} else if inv != nil {
 			a.logInvalidationFor(gctx, in.instID, inv, "request")
 		}
 	}
-	recent := tail(in.candles, analysisCandles)
 	snap := indicatorSnapshot(in.candles)
-	res, err := a.ai.Analyze(gctx, in.symbol, recent, in.quote, &snap)
+	mc, err := a.marketContext(gctx, in.instID, in.vol)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.ai.Analyze(gctx, AIInput{
+		Symbol: in.symbol, Method: in.method, Candles: tail(in.candles, analysisCandles),
+		Quote: in.quote, Indicators: &snap, Context: mc,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -327,6 +348,7 @@ func (a *App) generate(ctx context.Context, in genInput) (*genOut, error) {
 		Content: res.Content, Signal: res.Signal, PriceAtGen: priceAtGen,
 		Support: res.Support, Resistance: res.Resistance,
 		Origin: in.origin, State: in.state, Indicators: &snap,
+		Method: in.method, Confidence: res.Confidence, Detail: res.Detail,
 	})
 	if err != nil {
 		return nil, err
@@ -336,8 +358,17 @@ func (a *App) generate(ctx context.Context, in genInput) (*genOut, error) {
 		PromptVersion: pv, Origin: in.origin, SourceDataTS: last.TS, GeneratedAt: genAt,
 		PriceAtGeneration: priceAtGen, State: in.state, Support: res.Support, Resistance: res.Resistance,
 		TokensIn: res.TokensIn, TokensOut: res.TokensOut, CostUSD: res.CostUSD,
+		Method: in.method, Confidence: res.Confidence, Detail: res.Detail,
 	}
-	return &genOut{summary: s, res: res, ttl: a.policy.Set(gctx, in.symbol, s, in.vol)}, nil
+	out := &genOut{summary: s, res: res}
+	if res.valid() {
+		out.ttl = a.policy.Set(gctx, in.symbol, in.method, s, in.vol)
+	} else {
+		// Tetap tersimpan di ai_summaries dan inference_log (ai_format_ok = false) untuk diukur,
+		// tetapi tidak di-cache: request berikutnya mencoba generate lagi.
+		slog.Warn("output AI tidak valid, tidak di-cache", "symbol", in.symbol, "method", in.method, "summary_id", id)
+	}
+	return out, nil
 }
 
 // logInference: kegagalan menulis log tidak menggagalkan request.
@@ -359,7 +390,7 @@ func (a *App) logInvalidation(ctx context.Context, inv *Invalidation, detectedBy
 	e := CacheEvent{
 		InstrumentID: inv.InstrumentID, Reason: inv.Reason, Condition: a.policy.Name(),
 		Threshold: a.policy.Threshold(), Pregen: a.cfg.pregen, DetectedBy: detectedBy,
-		StateFrom: inv.StateFrom, StateTo: inv.StateTo,
+		StateFrom: inv.StateFrom, StateTo: inv.StateTo, Method: inv.Method,
 	}
 	if inv.Reason != "manual" || inv.ChangePct != 0 {
 		chg := inv.ChangePct

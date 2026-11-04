@@ -3,6 +3,7 @@ import useApi from "../../lib/useApi.js";
 import { getAdminCache, invalidateCache } from "../../lib/api.js";
 import { formatPlain } from "../../lib/format.js";
 import SignalBadge from "../../components/SignalBadge.jsx";
+import { METHODS } from "../../lib/methods.js";
 import {
   ErrorBox,
   Kpi,
@@ -26,7 +27,13 @@ const CACHE_STATUS = {
   empty: { status: "idle", label: "Kosong" },
   disabled: { status: "idle", label: "Cache nonaktif" },
 };
-const JOB_LABEL = { ingest_1h: "Ingestion candle 1h", ingest_1d: "Ingestion candle 1d", backtest: "Backtest sinyal 24 jam" };
+const JOB_LABEL = {
+  ingest_1h: "Ingestion candle 1h",
+  ingest_1d: "Ingestion candle 1d",
+  backtest: "Backtest bias 24 jam",
+  fundamentals: "Fundamental saham (Yahoo)",
+};
+const METHOD_SHORT = { debate: "Debate", mtf: "Multi-timeframe", grounded: "Grounded" };
 const REASON = { price_move: "Harga ≥ θ", state_change: "Kondisi S berubah", manual: "Manual (admin)", ttl_expired: "TTL habis" };
 const DETECTED = { watcher: "watcher", request: "saat request", scheduler: "scheduler", admin: "admin" };
 // "rsi:neutral;ema20:above;macd:pos" -> "RSI netral · di atas EMA20 · MACD +"
@@ -47,7 +54,7 @@ function useElapsed(stamp) {
   return Math.max(0, (now - stamp) / 1000);
 }
 
-function InvalidateButton({ symbol, disabled, onDone }) {
+function InvalidateButton({ symbol, method, disabled, onDone }) {
   const [state, setState] = useState("idle"); // idle | confirm | busy | error
   useEffect(() => {
     if (state !== "confirm") return;
@@ -59,7 +66,7 @@ function InvalidateButton({ symbol, disabled, onDone }) {
     if (state === "idle") return setState("confirm");
     setState("busy");
     try {
-      await invalidateCache(symbol);
+      await invalidateCache(symbol, method);
       setState("idle");
       onDone();
     } catch {
@@ -143,12 +150,13 @@ export default function CachePage() {
         <Table
           head={[
             "Instrumen",
+            "Metode",
             { label: "Akses", right: true },
             "Status",
             "Asal",
             { label: "Sisa TTL", right: true },
             "Dibuat",
-            "Sinyal",
+            "Bias",
             "Kondisi S (saat dibuat → sekarang)",
             { label: "Harga saat dibuat", right: true },
             { label: "Harga sekarang", right: true },
@@ -162,8 +170,11 @@ export default function CachePage() {
             const ttlLeft = r.ttl_seconds != null ? r.ttl_seconds - elapsed : null;
             const near = th != null && r.deviation_pct != null && Math.abs(r.deviation_pct) >= th * 0.75;
             return (
-              <tr key={r.symbol}>
+              <tr key={`${r.symbol}-${r.method}`}>
                 <Td className="font-semibold">{r.symbol}</Td>
+                <Td className="text-muted" title={METHODS.find((m) => m.id === r.method)?.name}>
+                  {METHOD_SHORT[r.method] ?? r.method}
+                </Td>
                 <Td right>{fmtInt(r.access)}</Td>
                 <Td>
                   <StatusDot status={st.status} label={st.label} />
@@ -187,6 +198,7 @@ export default function CachePage() {
                 <Td>
                   <InvalidateButton
                     symbol={r.symbol}
+                    method={r.method}
                     disabled={disabled || !(r.status === "cached" || r.status === "expiring")}
                     onDone={reload}
                   />
@@ -196,7 +208,9 @@ export default function CachePage() {
           })}
         </Table>
         <p className="mt-3 text-xs text-muted">
-          Akses = jumlah request dalam window popularitas (dasar pre-generation). Hampir habis = sisa TTL di bawah 5 menit.
+          Satu baris per instrumen per metode analisis (entri cache terpisah, aturan invalidasi sama). Akses = jumlah
+          request analisis dalam window popularitas (dasar pre-generation; satu kunjungan Detail = satu request per metode).
+          Hampir habis = sisa TTL di bawah 5 menit.
           Deviasi dan kondisi S berwarna kuning saat mendekati ambang / sudah berubah. Invalidate manual tercatat di
           cache_events dengan alasan "manual" — jangan dipakai saat eksperimen berjalan.
         </p>

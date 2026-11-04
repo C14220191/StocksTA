@@ -65,11 +65,13 @@ export const getCandles = (symbol, range, tf, signal) =>
 //  - panggilan yang sedang berjalan untuk symbol yang sama dipakai bersama (dedupe).
 // Dedupe ini juga mencegah double call dari React.StrictMode saat development,
 // yang kalau tidak, akan menggandakan baris inference_log dan token cost.
+// method: debate | mtf | grounded (lib/methods.js); satu kunjungan Detail = satu panggilan per metode.
 const inflight = new Map();
-export function analyzeSymbol(symbol) {
-  if (inflight.has(symbol)) return inflight.get(symbol);
-  const p = get(`/api/analyze/${sym(symbol)}`).finally(() => inflight.delete(symbol));
-  inflight.set(symbol, p);
+export function analyzeSymbol(symbol, method) {
+  const key = `${symbol}|${method}`;
+  if (inflight.has(key)) return inflight.get(key);
+  const p = get(`/api/analyze/${sym(symbol)}`, { method }).finally(() => inflight.delete(key));
+  inflight.set(key, p);
   return p;
 }
 
@@ -77,8 +79,10 @@ export function analyzeSymbol(symbol) {
 // period: 24h|7d|30d, trigger: all|ui|k6|scheduled|manual
 export const getAdminOverview = (params, signal) => get("/api/admin/overview", params, signal);
 export const getAdminCache = (signal) => get("/api/admin/cache", {}, signal);
-export const getAdminPrompt = (symbol, signal) => get("/api/admin/prompt", { symbol }, signal);
-// days, trigger, prompt: current|all
+export const getAdminPrompt = (symbol, method, signal) => get("/api/admin/prompt", { symbol, method }, signal);
+// days, trigger, prompt: current|all, method: all|debate|mtf|grounded
 export const getAdminEvaluation = (params, signal) => get("/api/admin/evaluation", params, signal);
 export const getAdminHealth = (signal) => get("/api/admin/health", {}, signal);
-export const invalidateCache = (symbol) => request("POST", `/api/admin/cache/${sym(symbol)}/invalidate`);
+// method kosong = semua metode instrument tersebut
+export const invalidateCache = (symbol, method) =>
+  request("POST", `/api/admin/cache/${sym(symbol)}/invalidate`, { method });

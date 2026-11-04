@@ -33,6 +33,9 @@ type CachedSummary struct {
 	TokensIn          int
 	TokensOut         int
 	CostUSD           float64
+	Method            string          // debate | mtf | grounded
+	Confidence        *int            // 0-100 dari AI
+	Detail            json.RawMessage `json:",omitempty"` // isi terstruktur per metode
 }
 
 // Invalidation menjelaskan kenapa entry cache dibuang (dicatat ke cache_events).
@@ -43,6 +46,7 @@ type Invalidation struct {
 	StateTo      string
 	SummaryID    int64
 	InstrumentID int
+	Method       string
 	CrossedAt    *time.Time // t_crossing; nil kalau tidak diketahui (mis. pemeriksaan saat request)
 }
 
@@ -54,16 +58,17 @@ type CachePolicy interface {
 	Name() string
 	// Threshold: ambang event invalidation θ (persen), nil kalau kondisi ini tidak memakainya.
 	Threshold() *float64
+	// Satu entry per (symbol, metode analisis).
 	// Get mengembalikan summary kalau HIT. Kalau entry ada tapi tidak lolos pemeriksaan
 	// (drift harga >= θ atau S berubah), entry dibuang, summary nil dan inv terisi.
-	Get(ctx context.Context, symbol string, price float64, state string) (s *CachedSummary, inv *Invalidation)
+	Get(ctx context.Context, symbol, method string, price float64, state string) (s *CachedSummary, inv *Invalidation)
 	// Set mengembalikan TTL yang diterapkan (detik), nil kalau tidak ada TTL.
-	Set(ctx context.Context, symbol string, s CachedSummary, volatility float64) *int
+	Set(ctx context.Context, symbol, method string, s CachedSummary, volatility float64) *int
 	Ping(ctx context.Context) error
 	// Inspect membaca entry tanpa efek samping (halaman admin). ttl < 0 = tanpa kedaluwarsa.
-	Inspect(ctx context.Context, symbol string) (s *CachedSummary, ttl time.Duration, err error)
+	Inspect(ctx context.Context, symbol, method string) (s *CachedSummary, ttl time.Duration, err error)
 	// Invalidate membuang entry secara manual; true kalau memang ada yang dibuang.
-	Invalidate(ctx context.Context, symbol string) (bool, error)
+	Invalidate(ctx context.Context, symbol, method string) (bool, error)
 }
 
 // policyConfig: kondisi eksperimen satu instance.
@@ -179,15 +184,15 @@ func newRedis() (*redis.Client, error) {
 // NoCache: setiap request selalu memanggil AI (baseline).
 type NoCache struct{}
 
-func (NoCache) Name() string                                             { return "no_cache" }
-func (NoCache) Threshold() *float64                                      { return nil }
-func (NoCache) Ping(context.Context) error                               { return nil }
-func (NoCache) Set(context.Context, string, CachedSummary, float64) *int { return nil }
-func (NoCache) Inspect(context.Context, string) (*CachedSummary, time.Duration, error) {
+func (NoCache) Name() string                                                     { return "no_cache" }
+func (NoCache) Threshold() *float64                                              { return nil }
+func (NoCache) Ping(context.Context) error                                       { return nil }
+func (NoCache) Set(context.Context, string, string, CachedSummary, float64) *int { return nil }
+func (NoCache) Inspect(context.Context, string, string) (*CachedSummary, time.Duration, error) {
 	return nil, 0, nil
 }
-func (NoCache) Invalidate(context.Context, string) (bool, error) { return false, nil }
-func (NoCache) Get(context.Context, string, float64, string) (*CachedSummary, *Invalidation) {
+func (NoCache) Invalidate(context.Context, string, string) (bool, error) { return false, nil }
+func (NoCache) Get(context.Context, string, string, float64, string) (*CachedSummary, *Invalidation) {
 	return nil, nil
 }
 
@@ -222,8 +227,10 @@ func (p *RedisPolicy) Threshold() *float64 {
 
 func (p *RedisPolicy) Ping(ctx context.Context) error { return p.rdb.Ping(ctx).Err() }
 
-func (p *RedisPolicy) key(symbol string) string {
-	return "ta:summary:" + p.prefix + ":" + p.version + ":" + symbol + ":" + analysisTimeframe
+// key: satu entry per (instance, prompt_version, symbol, metode), mis.
+// ta:summary:hybrid-2-pg:hermes-v5:BTCUSDT:debate
+func (p *RedisPolicy) key(symbol, method string) string {
+	return "ta:summary:" + p.prefix + ":" + p.version + ":" + symbol + ":" + method
 }
 
 // stale menilai pemeriksaan kedua dan ketiga (Gambar 3.4). nil = masih valid.
@@ -232,18 +239,19 @@ func (p *RedisPolicy) stale(s *CachedSummary, price float64, state string) *Inva
 		return nil
 	}
 	if dev, ok := priceDeviationPct(s.PriceAtGeneration, price); ok && math.Abs(dev) >= p.threshold {
-		return &Invalidation{Reason: "price_move", ChangePct: dev, SummaryID: s.SummaryID, InstrumentID: s.InstrumentID}
+		return &Invalidation{Reason: "price_move", ChangePct: dev, SummaryID: s.SummaryID,
+			InstrumentID: s.InstrumentID, Method: s.Method}
 	}
 	if p.checkState && s.State != "" && state != "" && s.State != state {
 		dev, _ := priceDeviationPct(s.PriceAtGeneration, price)
 		return &Invalidation{Reason: "state_change", ChangePct: dev, StateFrom: s.State, StateTo: state,
-			SummaryID: s.SummaryID, InstrumentID: s.InstrumentID}
+			SummaryID: s.SummaryID, InstrumentID: s.InstrumentID, Method: s.Method}
 	}
 	return nil
 }
 
-func (p *RedisPolicy) Get(ctx context.Context, symbol string, price float64, state string) (*CachedSummary, *Invalidation) {
-	b, err := p.rdb.Get(ctx, p.key(symbol)).Bytes()
+func (p *RedisPolicy) Get(ctx context.Context, symbol, method string, price float64, state string) (*CachedSummary, *Invalidation) {
+	b, err := p.rdb.Get(ctx, p.key(symbol, method)).Bytes()
 	if err != nil {
 		if !errors.Is(err, redis.Nil) {
 			slog.Error("redis get gagal", "err", err)
@@ -256,11 +264,12 @@ func (p *RedisPolicy) Get(ctx context.Context, symbol string, price float64, sta
 		return nil, nil
 	}
 	if inv := p.stale(&s, price, state); inv != nil {
+		inv.Method = method
 		// DEL mengembalikan 1 hanya untuk pemanggil yang benar-benar membuang entry (watcher atau
 		// request lain bisa lebih dulu), jadi event yang sama tidak tercatat dua kali.
-		if removed, _ := p.delIf(ctx, symbol, s.SummaryID); removed {
+		if removed, _ := p.delIf(ctx, symbol, method, s.SummaryID); removed {
 			if p.watcher != nil {
-				p.watcher.Untrack(symbol)
+				p.watcher.Untrack(symbol, method)
 			}
 			return nil, inv
 		}
@@ -269,21 +278,21 @@ func (p *RedisPolicy) Get(ctx context.Context, symbol string, price float64, sta
 	return &s, nil
 }
 
-func (p *RedisPolicy) del(ctx context.Context, symbol string) (bool, error) {
-	n, err := p.rdb.Del(ctx, p.key(symbol)).Result()
+func (p *RedisPolicy) del(ctx context.Context, symbol, method string) (bool, error) {
+	n, err := p.rdb.Del(ctx, p.key(symbol, method)).Result()
 	if err != nil {
 		slog.Error("redis del gagal", "err", err)
 	}
 	if n == 1 && p.watcher != nil {
-		p.watcher.Untrack(symbol)
+		p.watcher.Untrack(symbol, method)
 	}
 	return n == 1, err
 }
 
-func (p *RedisPolicy) Inspect(ctx context.Context, symbol string) (*CachedSummary, time.Duration, error) {
+func (p *RedisPolicy) Inspect(ctx context.Context, symbol, method string) (*CachedSummary, time.Duration, error) {
 	pipe := p.rdb.Pipeline()
-	get := pipe.Get(ctx, p.key(symbol))
-	ttl := pipe.PTTL(ctx, p.key(symbol))
+	get := pipe.Get(ctx, p.key(symbol, method))
+	ttl := pipe.PTTL(ctx, p.key(symbol, method))
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return nil, 0, err
 	}
@@ -301,22 +310,22 @@ func (p *RedisPolicy) Inspect(ctx context.Context, symbol string) (*CachedSummar
 	return &s, ttl.Val(), nil
 }
 
-func (p *RedisPolicy) Invalidate(ctx context.Context, symbol string) (bool, error) {
-	return p.del(ctx, symbol)
+func (p *RedisPolicy) Invalidate(ctx context.Context, symbol, method string) (bool, error) {
+	return p.del(ctx, symbol, method)
 }
 
-func (p *RedisPolicy) Set(ctx context.Context, symbol string, s CachedSummary, vol float64) *int {
+func (p *RedisPolicy) Set(ctx context.Context, symbol, method string, s CachedSummary, vol float64) *int {
 	b, err := json.Marshal(s)
 	if err != nil {
 		return nil
 	}
 	ttl := p.ttl(symbol, vol)
-	if err := p.rdb.Set(ctx, p.key(symbol), b, ttl).Err(); err != nil {
+	if err := p.rdb.Set(ctx, p.key(symbol, method), b, ttl).Err(); err != nil {
 		slog.Error("redis set gagal", "err", err)
 		return nil
 	}
 	if p.watcher != nil {
-		p.watcher.Track(symbol, s, time.Now().Add(ttl))
+		p.watcher.Track(symbol, method, s, time.Now().Add(ttl))
 	}
 	sec := int(ttl.Seconds())
 	return &sec

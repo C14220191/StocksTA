@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"time"
@@ -54,6 +55,7 @@ type InferenceLog struct {
 	StateAtGeneration string
 	StateAtRequest    string
 	StateChanged      *bool
+	Method            string // debate | mtf | grounded
 }
 
 // CacheEvent: satu invalidation (tabel cache_events). L_inv = waktu dicatat - CrossedAt.
@@ -70,6 +72,7 @@ type CacheEvent struct {
 	LatencyMS    *float64
 	StateFrom    string
 	StateTo      string
+	Method       string
 }
 
 type Store struct {
@@ -140,6 +143,9 @@ type NewSummary struct {
 	Origin         string // ondemand | pregen
 	State          string
 	Indicators     *IndicatorSnapshot
+	Method         string
+	Confidence     *int
+	Detail         json.RawMessage // nil -> NULL (output AI bukan JSON)
 }
 
 func (s *Store) InsertSummary(ctx context.Context, n NewSummary) (int64, time.Time, error) {
@@ -151,16 +157,20 @@ func (s *Store) InsertSummary(ctx context.Context, n NewSummary) (int64, time.Ti
 	case "BUY", "SELL", "HOLD":
 		sig = signal
 	}
+	var detail any // json.RawMessage nil harus jadi NULL, bukan string kosong
+	if len(n.Detail) > 0 {
+		detail = string(n.Detail)
+	}
 	var id int64
 	var genAt time.Time
 	err := s.pool.QueryRow(ctx, `
 		INSERT INTO ai_summaries
 		    (instrument_id, source_data_ts, prompt_version, model, content, signal, price_at_generation,
-		     support, resistance, origin, state_at_generation, indicators)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), $12)
+		     support, resistance, origin, state_at_generation, indicators, method, confidence, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), $12, $13, $14, $15::jsonb)
 		RETURNING id, generated_at`,
 		instID, sourceTS, pv, model, content, sig, priceAtGen, support, resistance,
-		n.Origin, n.State, n.Indicators).Scan(&id, &genAt)
+		n.Origin, n.State, n.Indicators, n.Method, n.Confidence, detail).Scan(&id, &genAt)
 	return id, genAt, err
 }
 
@@ -173,18 +183,18 @@ func (s *Store) LogInference(ctx context.Context, l InferenceLog) error {
 		     trigger, prompt_version, invalidation_threshold_pct, summary_id,
 		     price_at_generation, price_at_request, price_source, price_deviation_pct,
 		     cache_age_seconds, ai_queue_ms, ai_exec_ms, ai_format_ok, error,
-		     pregen, state_at_generation, state_at_request, state_changed)
+		     pregen, state_at_generation, state_at_request, state_changed, method)
 		VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, $12,
 		        $13, NULLIF($14, ''), $15, $16, $17, $18, NULLIF($19, ''), $20,
 		        $21, $22, $23, $24, NULLIF($25, ''),
-		        $26, NULLIF($27, ''), NULLIF($28, ''), $29)`,
+		        $26, NULLIF($27, ''), NULLIF($28, ''), $29, $30)`,
 		l.InstrumentID, l.Condition, l.CacheStatus, l.LatencyMS,
 		l.Model, l.TokensIn, l.TokensOut, l.CacheReadTokens, l.CostUSD,
 		l.DataAgeSeconds, l.TTLSeconds, l.Volatility,
 		l.Trigger, l.PromptVersion, l.Threshold, l.SummaryID,
 		l.PriceAtGeneration, l.PriceAtRequest, l.PriceSource, l.PriceDeviationPct,
 		l.CacheAgeSeconds, l.AIQueueMS, l.AIExecMS, l.AIFormatOK, l.Error,
-		l.Pregen, l.StateAtGeneration, l.StateAtRequest, l.StateChanged)
+		l.Pregen, l.StateAtGeneration, l.StateAtRequest, l.StateChanged, l.Method)
 	return err
 }
 
@@ -192,10 +202,10 @@ func (s *Store) LogCacheEvent(ctx context.Context, e CacheEvent) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO cache_events
 		    (instrument_id, reason, price_change_pct, experiment_condition, invalidation_threshold_pct, pregen,
-		     summary_id, detected_by, crossed_at, invalidation_latency_ms, state_from, state_to)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), NULLIF($12, ''))`,
+		     summary_id, detected_by, crossed_at, invalidation_latency_ms, state_from, state_to, method)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), NULLIF($12, ''), NULLIF($13, ''))`,
 		e.InstrumentID, e.Reason, e.ChangePct, e.Condition, e.Threshold, e.Pregen,
-		e.SummaryID, e.DetectedBy, e.CrossedAt, e.LatencyMS, e.StateFrom, e.StateTo)
+		e.SummaryID, e.DetectedBy, e.CrossedAt, e.LatencyMS, e.StateFrom, e.StateTo, e.Method)
 	return err
 }
 

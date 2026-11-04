@@ -11,8 +11,10 @@ import (
 )
 
 // Pre-generation terjadwal (Lapis 1, Bab 3.3.4). Popularitas instrument dihitung dari access
-// counter di Redis; setiap interval Δ, top-N instrument yang entrinya kosong, tidak valid, atau
-// akan kedaluwarsa sebelum siklus berikutnya di-generate ulang (refresh-ahead).
+// counter di Redis; setiap interval Δ, untuk top-N instrument, setiap metode analisis yang entrinya
+// kosong, tidak valid, atau akan kedaluwarsa sebelum siklus berikutnya di-generate ulang
+// (refresh-ahead). Satu kunjungan halaman detail = satu request per metode, jadi akses dihitung per
+// request; urutan popularitas tidak berubah karenanya.
 //
 // Entri hasil pre-generation ditandai origin = pregen ("used = false"). Entri dianggap terpakai
 // saat pertama kali disajikan sebagai HIT (inference_log.summary_id). Entri pregen yang tidak
@@ -124,24 +126,31 @@ func (a *App) runPregen(ctx context.Context) {
 	}
 }
 
-// pregenerateOne membuat ulang analisis satu instrument kalau entrinya tidak akan bertahan
-// sampai siklus berikutnya. Satu baris inference_log dengan cache_status PREGEN dan
-// trigger scheduled dicatat untuk setiap generate (token dan biayanya masuk N_gen).
+// pregenerateOne membuat ulang analisis satu instrument (semua metode) kalau entrinya tidak akan
+// bertahan sampai siklus berikutnya.
 func (a *App) pregenerateOne(ctx context.Context, symbol string) {
-	start := time.Now()
 	ac, err := a.loadAnalysisContext(ctx, symbol)
 	if err != nil {
 		slog.Warn("pre-generation: data tidak tersedia", "symbol", symbol, "err", err)
 		return
 	}
-	s, ttl, err := a.policy.Inspect(ctx, symbol)
+	for _, method := range analysisMethods {
+		a.pregenerateMethod(ctx, symbol, method, ac)
+	}
+}
+
+// pregenerateMethod: satu baris inference_log dengan cache_status PREGEN dan trigger scheduled
+// dicatat untuk setiap generate (token dan biayanya masuk N_gen).
+func (a *App) pregenerateMethod(ctx context.Context, symbol, method string, ac *analysisContext) {
+	start := time.Now()
+	s, ttl, err := a.policy.Inspect(ctx, symbol, method)
 	if err != nil {
-		slog.Error("pre-generation: inspect gagal", "symbol", symbol, "err", err)
+		slog.Error("pre-generation: inspect gagal", "symbol", symbol, "method", method, "err", err)
 		return
 	}
 	if s != nil && (ttl < 0 || ttl >= a.pregen.Interval) {
 		// Entri bertahan sampai siklus berikutnya; tetap jalankan pemeriksaan harga dan S.
-		cached, inv := a.policy.Get(ctx, symbol, ac.quote.Price, ac.state)
+		cached, inv := a.policy.Get(ctx, symbol, method, ac.quote.Price, ac.state)
 		if cached != nil {
 			return
 		}
@@ -150,9 +159,9 @@ func (a *App) pregenerateOne(ctx context.Context, symbol string) {
 		}
 	}
 
-	logEntry := a.baseLog(ac, "scheduled")
+	logEntry := a.baseLog(ac, "scheduled", method)
 	out, led, err := a.produce(ctx, genInput{
-		symbol: symbol, instID: ac.instID, candles: ac.candles, quote: ac.quote,
+		symbol: symbol, method: method, instID: ac.instID, candles: ac.candles, quote: ac.quote,
 		vol: ac.vol, state: ac.state, origin: "pregen", force: true,
 	})
 	if err != nil {
@@ -168,7 +177,7 @@ func (a *App) pregenerateOne(ctx context.Context, symbol string) {
 	logEntry.TTLSeconds = out.ttl
 	a.finishLog(&logEntry, "PREGEN", time.Since(start), out.summary, ac, out.res)
 	a.logInference(ctx, logEntry)
-	slog.Info("pre-generation", "symbol", symbol, "summary_id", out.summary.SummaryID,
+	slog.Info("pre-generation", "symbol", symbol, "method", method, "summary_id", out.summary.SummaryID,
 		"ttl", strconv.Itoa(derefInt(out.ttl))+"s")
 }
 

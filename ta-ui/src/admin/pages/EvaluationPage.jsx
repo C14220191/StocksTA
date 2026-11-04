@@ -37,7 +37,15 @@ const SOURCES = [
   { value: "pilot", label: "Pilot study" },
   { value: "manual", label: "Manual" },
 ];
+const METHOD_FILTER = [
+  { value: "all", label: "Semua metode" },
+  { value: "debate", label: "Multi-Agent Debate" },
+  { value: "mtf", label: "Multi-Timeframe" },
+  { value: "grounded", label: "Grounded Brief" },
+  { value: "summary", label: "Ringkasan tunggal (≤ hermes-v4)" },
+];
 const THETA_S = ["1", "2", "5", "10"];
+const BIAS_OF = { BUY: "bullish", SELL: "bearish", HOLD: "netral" };
 
 const pct = (v, d = 1) => (v == null ? "-" : `${v.toFixed(d)}%`);
 const rowKey = (r) => `${r.condition}-${r.threshold_pct}-${r.pregen}`;
@@ -89,10 +97,11 @@ export default function EvaluationPage() {
   const [days, setDays] = useState(params.get("days") ?? "30");
   const [trigger, setTrigger] = useState(params.get("trigger") ?? "all");
   const [prompt, setPrompt] = useState(params.get("prompt") ?? "current");
+  const [method, setMethod] = useState(params.get("method") ?? "all");
   const [thetaS, setThetaS] = useState("2");
   const { data, error, loading, reload } = useApi(
-    (signal) => getAdminEvaluation({ days, trigger, prompt }, signal),
-    [days, trigger, prompt]
+    (signal) => getAdminEvaluation({ days, trigger, prompt, method }, signal),
+    [days, trigger, prompt, method]
   );
   const rows = data?.conditions ?? [];
   const base = rows.find((r) => r.condition === "no_cache");
@@ -104,9 +113,10 @@ export default function EvaluationPage() {
         <Segmented label="Rentang" value={days} options={RANGES} onChange={setDays} />
         <Select label="Sumber" value={trigger} options={SOURCES} onChange={setTrigger} />
         <Select label="Prompt" value={prompt} options={PROMPTS} onChange={setPrompt} />
+        <Select label="Metode" value={method} options={METHOD_FILTER} onChange={setMethod} />
         {rows.length > 0 && (
           <button
-            onClick={() => downloadCsv(rows, `evaluasi-${data.days}hari-${data.trigger}.csv`)}
+            onClick={() => downloadCsv(rows, `evaluasi-${data.days}hari-${data.trigger}-${data.method}.csv`)}
             className="rounded-lg border border-line px-3 py-2 text-xs font-semibold text-muted hover:text-ink"
           >
             Unduh CSV
@@ -268,15 +278,16 @@ export default function EvaluationPage() {
           )}
         </Panel>
 
-        <Panel title="Akurasi sinyal (backtest 24 jam)" aside="BUY benar jika naik > band, SELL turun > band, HOLD dalam band">
+        <Panel title="Akurasi bias (backtest 24 jam)" aside="bullish benar jika naik > band, bearish turun > band, netral dalam band">
           <Table
-            head={["Instrumen", "Sinyal", { label: "n", right: true }, { label: "Benar", right: true }, { label: "Akurasi", right: true }, { label: "Return 24 jam", right: true }]}
-            empty={data && data.accuracy.length === 0 ? "Belum ada ringkasan yang di-backtest." : null}
+            head={["Instrumen", "Metode", "Bias", { label: "n", right: true }, { label: "Benar", right: true }, { label: "Akurasi", right: true }, { label: "Return 24 jam", right: true }]}
+            empty={data && data.accuracy.length === 0 ? "Belum ada analisis yang di-backtest." : null}
           >
             {data?.accuracy.map((a) => (
-              <tr key={`${a.symbol}-${a.signal}`}>
+              <tr key={`${a.symbol}-${a.method}-${a.signal}`}>
                 <Td className="font-semibold">{a.symbol}</Td>
-                <Td>{a.signal}</Td>
+                <Td className="text-muted">{a.method}</Td>
+                <Td>{BIAS_OF[a.signal] ?? a.signal}</Td>
                 <Td right>{fmtInt(a.n)}</Td>
                 <Td right>{fmtInt(a.correct)}</Td>
                 <Td right>{pct((a.correct / a.n) * 100, 0)}</Td>

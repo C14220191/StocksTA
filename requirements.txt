@@ -3,3 +3,4 @@ uvicorn
 yfinance
 psycopg2-binary
 requests
+json-repair

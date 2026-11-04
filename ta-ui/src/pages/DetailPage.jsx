@@ -1,22 +1,22 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import SignalBadge from "../components/SignalBadge.jsx";
 import PriceChart from "../components/PriceChart.jsx";
 import IndicatorPicker from "../components/IndicatorPicker.jsx";
 import LiveBadge from "../components/LiveBadge.jsx";
+import AiAnalysis, { useAnalyses } from "../components/AiAnalysis.jsx";
 import useApi from "../lib/useApi.js";
-import { analyzeSymbol, getCandles, getInstrument } from "../lib/api.js";
+import { getCandles, getInstrument } from "../lib/api.js";
 import { liveMarket } from "../lib/binance.js";
+import { METHODS, consensus } from "../lib/methods.js";
 import {
   ageSecondsFromIso,
   assetLabel,
   changeClass,
   formatAgeSeconds,
-  formatCandleTime,
   formatChange,
   formatPrice,
   formatVolume,
-  localizeUtcTimes,
 } from "../lib/format.js";
 
 // Rentang = parameter `range`; ukuran candle = parameter `tf`.
@@ -27,30 +27,11 @@ const TIMEFRAMES = ["1h", "2h", "4h", "6h", "1d"];
 const RANGE_HOURS = { "1D": 24, "1W": 168, "1M": 720, "3M": 2160, "6M": 4368, "1Y": 8760, ALL: 8760 };
 const TF_HOURS = { "1h": 1, "2h": 2, "4h": 4, "6h": 6, "1d": 24 };
 
-// Harga bergerak sejauh ini (persen) sejak analisis dibuat -> tampilkan peringatan di panel AI.
-const MOVE_WARN_PCT = 1;
-
 // Backend menerima 6 sampai 10.000 candle; UI membatasi 1.000 supaya chart dan indikator tetap ringan.
 const tfAllowed = (range, tf) => {
   const n = RANGE_HOURS[range] / TF_HOURS[tf];
   return n >= 6 && n <= 1000;
 };
-
-// /api/analyze dipanggil sekali per kunjungan, dan hanya setelah instrumennya terbukti ada.
-function useAnalysis(symbol, enabled) {
-  const [state, setState] = useState({ data: null, error: null, loading: true });
-  useEffect(() => {
-    if (!enabled) return;
-    let cancelled = false;
-    analyzeSymbol(symbol)
-      .then((data) => !cancelled && setState({ data, error: null, loading: false }))
-      .catch((error) => !cancelled && setState({ data: null, error, loading: false }));
-    return () => {
-      cancelled = true;
-    };
-  }, [symbol, enabled]);
-  return state;
-}
 
 function StatCard({ label, value }) {
   return (
@@ -86,79 +67,6 @@ function SegButton({ selected, disabled, title, onClick, children }) {
   );
 }
 
-// Asal ringkasan yang tampil: dibuat AI untuk kunjungan ini (MISS/BYPASS), dari cache (HIT),
-// atau ringkasan tersimpan terakhir yang ditampilkan sambil menunggu /api/analyze.
-function analysisOrigin(fresh) {
-  if (!fresh) return "Analisis tersimpan, dibuat";
-  if (fresh.cache_status === "HIT") return "Dari cache, dianalisis";
-  return "Analisis baru, dibuat";
-}
-
-function AiPanel({ latest, ai, currency, livePrice }) {
-  const fresh = ai.data;
-  const shown = fresh ?? latest; // tampilkan ringkasan tersimpan dulu sambil menunggu analisis terbaru
-  const hasLevels = shown?.support != null && shown?.resistance != null;
-  // source_data_ts = waktu BUKA candle 1h terakhir yang dilihat AI; candle itu tutup 1 jam kemudian.
-  const dataUntil = shown?.source_data_ts ? new Date(shown.source_data_ts).getTime() / 1000 + 3600 : null;
-  const priceAtGen = fresh?.price_at_generation > 0 ? fresh.price_at_generation : null; // ai_latest belum membawa harga
-  // Kripto: dihitung ulang dari harga live supaya ikut bergerak; saham: nilai dari backend.
-  const deviation = priceAtGen && livePrice ? (livePrice / priceAtGen - 1) * 100 : fresh?.price_deviation_pct ?? null;
-  const moved = deviation != null && Math.abs(deviation) >= MOVE_WARN_PCT;
-
-  return (
-    <section className="bg-panel p-6 font-sans" aria-live="polite">
-      <h2 className="text-base font-semibold">Ringkasan analisis AI</h2>
-
-      {!shown && ai.loading && (
-        <div className="mt-4 space-y-2" aria-busy="true">
-          <div className="h-3 w-full animate-pulse rounded bg-panel-2" />
-          <div className="h-3 w-11/12 animate-pulse rounded bg-panel-2" />
-          <div className="h-3 w-4/5 animate-pulse rounded bg-panel-2" />
-          <p className="pt-2 text-xs text-muted">Menyiapkan analisis, bisa memakan 5 sampai 15 detik...</p>
-        </div>
-      )}
-
-      {!shown && ai.error && <p className="mt-3 text-sm text-down">{ai.error.message}</p>}
-
-      {shown && (
-        <>
-          <p className="mt-3 whitespace-pre-line text-sm leading-relaxed">
-            {localizeUtcTimes(shown.summary, shown.generated_at)}
-          </p>
-          {hasLevels && (
-            <p className="mt-3 text-xs text-muted">
-              Level menurut AI: support {formatPrice(shown.support, currency, { short: true })} · resistance{" "}
-              {formatPrice(shown.resistance, currency, { short: true })}
-            </p>
-          )}
-          <p className="mt-4 text-xs text-muted">
-            {analysisOrigin(fresh)} {formatCandleTime(new Date(shown.generated_at).getTime() / 1000)} (
-            {formatAgeSeconds(ageSecondsFromIso(shown.generated_at))})
-            {dataUntil && <> · data candle hingga {formatCandleTime(dataUntil)}</>}
-            {priceAtGen && <> · harga saat analisis {formatPrice(priceAtGen, currency, { short: true })}</>}
-          </p>
-          {moved && (
-            <p className="mt-2 text-xs text-hold">
-              Harga sudah bergerak {formatChange(deviation)} sejak analisis ini dibuat, ringkasan mungkin kurang relevan.
-            </p>
-          )}
-          {ai.loading && (
-            <p className="mt-2 flex items-center gap-2 text-xs text-hold">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-hold" />
-              Memperbarui analisis, bisa memakan 5 sampai 15 detik jika belum ada di cache...
-            </p>
-          )}
-          {ai.error && (
-            <p className="mt-2 text-xs text-hold">
-              Pembaruan analisis gagal ({ai.error.message}). Menampilkan analisis yang tersimpan.
-            </p>
-          )}
-        </>
-      )}
-    </section>
-  );
-}
-
 export default function DetailPage({ symbol }) {
   const [range, setRange] = useState("1D");
   const [tf, setTf] = useState("auto"); // "auto" = bawaan backend untuk range tsb
@@ -171,7 +79,7 @@ export default function DetailPage({ symbol }) {
     (signal) => getCandles(symbol, range, tf === "auto" ? undefined : tf, signal),
     [symbol, range, tf]
   );
-  const ai = useAnalysis(symbol, !!detail.data);
+  const analyses = useAnalyses(symbol, !!detail.data);
 
   const changeRange = (r) => {
     setRange(r);
@@ -215,12 +123,15 @@ export default function DetailPage({ symbol }) {
   const prevClose = inst?.change_pct != null && inst.change_pct > -100 ? inst.price / (1 + inst.change_pct / 100) : null;
   const shownChange = livePrice != null && prevClose ? (livePrice / prevClose - 1) * 100 : inst?.change_pct;
   const pickerCtx = { timeframe: candles.data?.timeframe, assetType: inst?.asset_type };
+  // Bias gabungan tiga metode: dari analisis kunjungan ini kalau sudah ada, selain itu dari tabel instrument.
+  const freshSignals = METHODS.map((m) => analyses[m.id]?.data?.detail && analyses[m.id].data.signal);
+  const headerSignal = freshSignals.some(Boolean) ? consensus(freshSignals) : inst?.signal;
 
   return (
     <div>
       <div className="flex items-baseline gap-3">
         <h1 className="text-xl font-bold">{inst?.display_symbol ?? symbol}</h1>
-        {inst && <SignalBadge signal={ai.data?.signal ?? inst.signal} />}
+        {inst && <SignalBadge signal={headerSignal} />}
       </div>
       <p className="mt-1 min-h-4 text-xs text-muted">{inst ? `${inst.name} - ${assetLabel(inst.asset_type)}` : ""}</p>
 
@@ -300,17 +211,21 @@ export default function DetailPage({ symbol }) {
         )}
       </div>
 
-      <div className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)]">
-        <div className="grid grid-cols-2 gap-4 self-start">
-          <StatCard label="RSI (14)" value={stats?.rsi14 != null ? stats.rsi14.toFixed(1) : "-"} />
-          <StatCard label="Support" value={price(stats?.support)} />
-          <StatCard label="Resistance" value={price(stats?.resistance)} />
-          <StatCard label="Volume 24 jam" value={formatVolume(stats?.volume_24h)} />
-          {stats?.basis && <p className="col-span-2 font-sans text-xs text-muted">Dasar: {stats.basis}</p>}
-        </div>
-
-        <AiPanel latest={detail.data?.ai_latest} ai={ai} currency={currency} livePrice={livePrice} />
+      <div className="mt-8 grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatCard label="RSI (14)" value={stats?.rsi14 != null ? stats.rsi14.toFixed(1) : "-"} />
+        <StatCard label="Support" value={price(stats?.support)} />
+        <StatCard label="Resistance" value={price(stats?.resistance)} />
+        <StatCard label="Volume 24 jam" value={formatVolume(stats?.volume_24h)} />
       </div>
+      {stats?.basis && <p className="mt-2 font-sans text-xs text-muted">Dasar: {stats.basis}</p>}
+
+      <AiAnalysis
+        latest={detail.data?.ai_latest}
+        analyses={analyses}
+        currency={currency}
+        livePrice={livePrice}
+        assetType={inst?.asset_type}
+      />
     </div>
   );
 }

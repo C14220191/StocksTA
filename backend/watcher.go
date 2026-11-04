@@ -17,6 +17,8 @@ import (
 //	t_crossing     = waktu transaksi (jam bursa) dari tick yang pertama kali melewati batas
 //	L_inv          = waktu dicatat - t_crossing  (invalidation latency)
 //
+// Satu instrument punya satu entri per metode analisis; semuanya memakai aturan yang sama, jadi
+// satu tick memeriksa semua metode dengan S yang dihitung sekali.
 // Instrument tanpa tick (saham IDX, harga dari ingestion per jam) dan perubahan S karena candle
 // baru tutup diperiksa oleh loop refresh tiap WATCHER_REFRESH_SECONDS.
 type Watcher struct {
@@ -24,9 +26,11 @@ type Watcher struct {
 	policy *RedisPolicy
 
 	mu      sync.Mutex
-	entries map[string]*watchEntry
-	models  map[string]*IndicatorModel
+	entries map[watchKey]*watchEntry
+	models  map[string]*IndicatorModel // per symbol
 }
+
+type watchKey struct{ symbol, method string }
 
 type watchEntry struct {
 	summary   CachedSummary
@@ -34,14 +38,14 @@ type watchEntry struct {
 }
 
 func newWatcher(app *App, policy *RedisPolicy) *Watcher {
-	w := &Watcher{app: app, policy: policy, entries: map[string]*watchEntry{}, models: map[string]*IndicatorModel{}}
+	w := &Watcher{app: app, policy: policy, entries: map[watchKey]*watchEntry{}, models: map[string]*IndicatorModel{}}
 	policy.watcher = w
 	return w
 }
 
-func (w *Watcher) Track(symbol string, s CachedSummary, expiresAt time.Time) {
+func (w *Watcher) Track(symbol, method string, s CachedSummary, expiresAt time.Time) {
 	w.mu.Lock()
-	w.entries[symbol] = &watchEntry{summary: s, expiresAt: expiresAt}
+	w.entries[watchKey{symbol, method}] = &watchEntry{summary: s, expiresAt: expiresAt}
 	_, hasModel := w.models[symbol]
 	w.mu.Unlock()
 	if !hasModel && w.policy.checkState {
@@ -49,9 +53,9 @@ func (w *Watcher) Track(symbol string, s CachedSummary, expiresAt time.Time) {
 	}
 }
 
-func (w *Watcher) Untrack(symbol string) {
+func (w *Watcher) Untrack(symbol, method string) {
 	w.mu.Lock()
-	delete(w.entries, symbol)
+	delete(w.entries, watchKey{symbol, method})
 	w.mu.Unlock()
 }
 
@@ -61,36 +65,39 @@ func (w *Watcher) OnTick(symbol string, price float64, ts time.Time) {
 }
 
 func (w *Watcher) check(symbol string, price float64, crossedAt time.Time) {
+	var fired []*Invalidation
+	now := time.Now()
 	w.mu.Lock()
-	e := w.entries[symbol]
-	if e == nil {
-		w.mu.Unlock()
-		return
+	state, stateDone := "", false
+	for _, method := range analysisMethods {
+		k := watchKey{symbol, method}
+		e := w.entries[k]
+		if e == nil {
+			continue
+		}
+		if now.After(e.expiresAt) { // sudah kedaluwarsa di Redis
+			delete(w.entries, k)
+			continue
+		}
+		if w.policy.checkState && !stateDone {
+			state, stateDone = w.models[symbol].State(price), true // model nil -> "" -> S tidak diperiksa
+		}
+		if inv := w.policy.stale(&e.summary, price, state); inv != nil {
+			delete(w.entries, k)
+			inv.CrossedAt, inv.Method = &crossedAt, method
+			fired = append(fired, inv)
+		}
 	}
-	if time.Now().After(e.expiresAt) { // sudah kedaluwarsa di Redis
-		delete(w.entries, symbol)
-		w.mu.Unlock()
-		return
-	}
-	state := ""
-	if w.policy.checkState {
-		state = w.models[symbol].State(price) // model nil -> "" -> S tidak diperiksa
-	}
-	inv := w.policy.stale(&e.summary, price, state)
-	if inv == nil {
-		w.mu.Unlock()
-		return
-	}
-	delete(w.entries, symbol)
 	w.mu.Unlock()
-	inv.CrossedAt = &crossedAt
-	go w.invalidate(symbol, inv)
+	for _, inv := range fired {
+		go w.invalidate(symbol, inv)
+	}
 }
 
 func (w *Watcher) invalidate(symbol string, inv *Invalidation) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if removed, err := w.policy.delIf(ctx, symbol, inv.SummaryID); err != nil || !removed {
+	if removed, err := w.policy.delIf(ctx, symbol, inv.Method, inv.SummaryID); err != nil || !removed {
 		return // entri sudah diganti / dibuang pihak lain
 	}
 	w.app.logInvalidation(ctx, inv, "watcher")
@@ -122,9 +129,9 @@ func (w *Watcher) Run(ctx context.Context) {
 		case <-t.C:
 		}
 		w.mu.Lock()
-		tracked := map[string]int{}
-		for sym, e := range w.entries {
-			tracked[sym] = e.summary.InstrumentID
+		tracked := map[string]int{} // symbol -> instrument id
+		for k, e := range w.entries {
+			tracked[k.symbol] = e.summary.InstrumentID
 		}
 		w.mu.Unlock()
 		for sym, instID := range tracked {
@@ -157,8 +164,8 @@ local ok, s = pcall(cjson.decode, v)
 if ok and tostring(s['SummaryID']) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0`)
 
-func (p *RedisPolicy) delIf(ctx context.Context, symbol string, summaryID int64) (bool, error) {
-	n, err := delIfScript.Run(ctx, p.rdb, []string{p.key(symbol)}, strconv.FormatInt(summaryID, 10)).Int()
+func (p *RedisPolicy) delIf(ctx context.Context, symbol, method string, summaryID int64) (bool, error) {
+	n, err := delIfScript.Run(ctx, p.rdb, []string{p.key(symbol, method)}, strconv.FormatInt(summaryID, 10)).Int()
 	if err != nil {
 		slog.Error("redis delIf gagal", "err", err)
 	}

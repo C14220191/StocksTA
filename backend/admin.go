@@ -257,6 +257,7 @@ func (a *App) AdminOverview(c echo.Context) error {
 
 type cacheRow struct {
 	Symbol            string   `json:"symbol"`
+	Method            string   `json:"method"`
 	AssetType         string   `json:"asset_type"`
 	Status            string   `json:"status"` // cached | expiring | empty | disabled
 	TTLSeconds        *int     `json:"ttl_seconds"`
@@ -312,18 +313,23 @@ func (a *App) AdminCache(c echo.Context) error {
 		return a.fail(c, err)
 	}
 
-	lastTTL := map[int]int{}
+	type instMethod struct {
+		id     int
+		method string
+	}
+	lastTTL := map[instMethod]int{}
 	rows, err = a.store.pool.Query(ctx, `
-		SELECT DISTINCT ON (instrument_id) instrument_id, ttl_applied_seconds
+		SELECT DISTINCT ON (instrument_id, method) instrument_id, method, ttl_applied_seconds
 		FROM inference_log WHERE ttl_applied_seconds IS NOT NULL AND experiment_condition = $1
-		ORDER BY instrument_id, created_at DESC`, a.policy.Name())
+		ORDER BY instrument_id, method, created_at DESC`, a.policy.Name())
 	if err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
-		var id, ttl int
-		if err := rows.Scan(&id, &ttl); err == nil {
-			lastTTL[id] = ttl
+		var k instMethod
+		var ttl int
+		if err := rows.Scan(&k.id, &k.method, &ttl); err == nil {
+			lastTTL[k] = ttl
 		}
 	}
 	rows.Close()
@@ -338,47 +344,57 @@ func (a *App) AdminCache(c echo.Context) error {
 	for _, p := range pop {
 		access[p.Symbol] = p.Hits
 	}
+	// Satu baris per (instrument, metode); harga dan S sekarang dihitung sekali per instrument.
 	out := []cacheRow{}
 	for _, in := range insts {
-		r := cacheRow{Symbol: in.symbol, AssetType: in.assetType, Status: "empty", Access: access[in.symbol]}
-		if t, ok := lastTTL[in.id]; ok {
-			r.LastTTLApplied = &t
-		}
+		base := cacheRow{Symbol: in.symbol, AssetType: in.assetType, Status: "empty", Access: access[in.symbol]}
 		if q, err := a.CurrentQuote(ctx, in.symbol, in.id); err == nil && q.Price > 0 {
-			r.PriceNow, r.PriceSource = &q.Price, q.Source
+			base.PriceNow, base.PriceSource = &q.Price, q.Source
 		}
-		if disabled {
-			r.Status = "disabled"
+		stateNow, stateLoaded := "", false
+		for _, method := range analysisMethods {
+			r := base
+			r.Method = method
+			if t, ok := lastTTL[instMethod{in.id, method}]; ok {
+				r.LastTTLApplied = &t
+			}
+			if disabled {
+				r.Status = "disabled"
+				out = append(out, r)
+				continue
+			}
+			s, ttl, err := a.policy.Inspect(ctx, in.symbol, method)
+			if err != nil {
+				return a.fail(c, err)
+			}
+			if s != nil {
+				r.Status = "cached"
+				if ttl >= 0 {
+					sec := int(ttl.Seconds())
+					r.TTLSeconds = &sec
+					if ttl < expiringTTL {
+						r.Status = "expiring"
+					}
+				}
+				g := s.GeneratedAt.Format(time.RFC3339)
+				r.GeneratedAt, r.Signal, r.Origin, r.StateGen = &g, s.Signal, s.Origin, s.State
+				if !stateLoaded {
+					if ac, err := a.loadAnalysisContext(ctx, in.symbol); err == nil {
+						stateNow = ac.state
+					}
+					stateLoaded = true
+				}
+				r.StateNow = stateNow
+				if s.PriceAtGeneration > 0 {
+					p := s.PriceAtGeneration
+					r.PriceAtGeneration = &p
+					if dev, ok := priceDeviationPct(p, f64(r.PriceNow)); ok {
+						r.DeviationPct = &dev
+					}
+				}
+			}
 			out = append(out, r)
-			continue
 		}
-		s, ttl, err := a.policy.Inspect(ctx, in.symbol)
-		if err != nil {
-			return a.fail(c, err)
-		}
-		if s != nil {
-			r.Status = "cached"
-			if ttl >= 0 {
-				sec := int(ttl.Seconds())
-				r.TTLSeconds = &sec
-				if ttl < expiringTTL {
-					r.Status = "expiring"
-				}
-			}
-			g := s.GeneratedAt.Format(time.RFC3339)
-			r.GeneratedAt, r.Signal, r.Origin, r.StateGen = &g, s.Signal, s.Origin, s.State
-			if ac, err := a.loadAnalysisContext(ctx, in.symbol); err == nil {
-				r.StateNow = ac.state
-			}
-			if s.PriceAtGeneration > 0 {
-				p := s.PriceAtGeneration
-				r.PriceAtGeneration = &p
-				if dev, ok := priceDeviationPct(p, f64(r.PriceNow)); ok {
-					r.DeviationPct = &dev
-				}
-			}
-		}
-		out = append(out, r)
 	}
 
 	var hits, misses, invalidations, scheduled, backtestPending int
@@ -418,6 +434,7 @@ func (a *App) AdminCache(c echo.Context) error {
 	type event struct {
 		At         time.Time `json:"at"`
 		Symbol     string    `json:"symbol"`
+		Method     *string   `json:"method"`
 		Reason     string    `json:"reason"`
 		ChangePct  *float64  `json:"change_pct"`
 		DetectedBy *string   `json:"detected_by"`
@@ -427,7 +444,7 @@ func (a *App) AdminCache(c echo.Context) error {
 	}
 	// Hanya event instance ini (instance lain bisa berjalan paralel di database yang sama).
 	rows, err = a.store.pool.Query(ctx, `
-		SELECT e.created_at, i.symbol, e.reason, e.price_change_pct::float8, e.detected_by,
+		SELECT e.created_at, i.symbol, e.method, e.reason, e.price_change_pct::float8, e.detected_by,
 		       e.invalidation_latency_ms::float8, e.state_from, e.state_to
 		FROM cache_events e JOIN instruments i ON i.id = e.instrument_id
 		WHERE e.experiment_condition = $1
@@ -438,7 +455,7 @@ func (a *App) AdminCache(c echo.Context) error {
 	}
 	events, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (event, error) {
 		var e event
-		err := r.Scan(&e.At, &e.Symbol, &e.Reason, &e.ChangePct, &e.DetectedBy, &e.LatencyMS, &e.StateFrom, &e.StateTo)
+		err := r.Scan(&e.At, &e.Symbol, &e.Method, &e.Reason, &e.ChangePct, &e.DetectedBy, &e.LatencyMS, &e.StateFrom, &e.StateTo)
 		return e, err
 	})
 	if err != nil {
@@ -498,6 +515,7 @@ func (a *App) jobRuns(ctx context.Context) ([]jobStatus, []jobRun, error) {
 		{"ingest_1h", "tiap jam (menit ke-5)", 75 * time.Minute},
 		{"ingest_1d", "tiap jam / harian", 26 * time.Hour},
 		{"backtest", "tiap jam / harian", 26 * time.Hour},
+		{"fundamentals", "harian", 50 * time.Hour},
 	}
 	jobs := []jobStatus{}
 	for _, e := range expected {
@@ -533,10 +551,18 @@ func (a *App) jobRuns(ctx context.Context) ([]jobStatus, []jobRun, error) {
 	return jobs, runs, err
 }
 
-// POST /api/admin/cache/:symbol/invalidate — buang entry cache satu instrument (reason manual).
+// POST /api/admin/cache/:symbol/invalidate?method=debate — buang entry cache satu instrument
+// (reason manual). Tanpa method: semua metode.
 func (a *App) AdminInvalidate(c echo.Context) error {
 	ctx := c.Request().Context()
 	symbol := strings.ToUpper(c.Param("symbol"))
+	methods := analysisMethods
+	if m := strings.ToLower(c.QueryParam("method")); m != "" {
+		if !validMethod(m) {
+			return badRequest(c, errors.New("method harus salah satu dari "+methodsList))
+		}
+		methods = []string{m}
+	}
 	instID, err := a.store.InstrumentID(ctx, symbol)
 	if errors.Is(err, ErrNotFound) {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "instrument tidak ditemukan"})
@@ -547,16 +573,21 @@ func (a *App) AdminInvalidate(c echo.Context) error {
 	if a.policy.Name() == "no_cache" {
 		return c.JSON(http.StatusConflict, map[string]string{"error": "cache tidak aktif (no_cache)"})
 	}
-	s, _, err := a.policy.Inspect(ctx, symbol)
-	if err != nil {
-		return a.fail(c, err)
-	}
-	removed, err := a.policy.Invalidate(ctx, symbol)
-	if err != nil {
-		return a.fail(c, err)
-	}
-	if removed {
-		inv := &Invalidation{Reason: "manual", InstrumentID: instID}
+	removed := []string{}
+	for _, method := range methods {
+		s, _, err := a.policy.Inspect(ctx, symbol, method)
+		if err != nil {
+			return a.fail(c, err)
+		}
+		ok, err := a.policy.Invalidate(ctx, symbol, method)
+		if err != nil {
+			return a.fail(c, err)
+		}
+		if !ok {
+			continue
+		}
+		removed = append(removed, method)
+		inv := &Invalidation{Reason: "manual", InstrumentID: instID, Method: method}
 		if s != nil {
 			inv.SummaryID = s.SummaryID
 			if q, err := a.CurrentQuote(ctx, symbol, instID); err == nil {
@@ -567,20 +598,28 @@ func (a *App) AdminInvalidate(c echo.Context) error {
 		}
 		a.logInvalidation(ctx, inv, "admin")
 	}
-	return c.JSON(http.StatusOK, map[string]any{"symbol": symbol, "removed": removed})
+	return c.JSON(http.StatusOK, map[string]any{"symbol": symbol, "removed": len(removed) > 0, "methods": removed})
 }
 
 // ---- Prompt ----
 
-// GET /api/admin/prompt?symbol=BTCUSDT — prompt aktif dirender dengan data terkini (tanpa memanggil
-// model, tanpa token) + riwayat versi prompt dari ai_summaries.
+// GET /api/admin/prompt?symbol=BTCUSDT&method=debate — prompt aktif satu metode dirender dengan data
+// terkini (tanpa memanggil model, tanpa token), isi skill Hermes-nya, dan riwayat versi prompt.
 func (a *App) AdminPrompt(c echo.Context) error {
 	ctx := c.Request().Context()
 	symbol := strings.ToUpper(c.QueryParam("symbol"))
 	if symbol == "" {
 		symbol = "BTCUSDT"
 	}
-	resp := map[string]any{"active_version": env("PROMPT_VERSION", promptVersion), "symbol": symbol}
+	method := strings.ToLower(c.QueryParam("method"))
+	if method == "" {
+		method = analysisMethods[0]
+	}
+	if !validMethod(method) {
+		return badRequest(c, errors.New("method harus salah satu dari "+methodsList))
+	}
+	resp := map[string]any{"active_version": env("PROMPT_VERSION", promptVersion), "symbol": symbol,
+		"method": method, "methods": analysisMethods}
 
 	instID, err := a.store.InstrumentID(ctx, symbol)
 	if errors.Is(err, ErrNotFound) {
@@ -595,7 +634,13 @@ func (a *App) AdminPrompt(c echo.Context) error {
 	}
 	quote, _ := a.CurrentQuote(ctx, symbol, instID)
 	snap := indicatorSnapshot(candles)
-	if preview, err := promptPreview(ctx, newAIRequest(symbol, tail(candles, analysisCandles), quote, &snap)); err != nil {
+	mc, err := a.marketContext(ctx, instID, realizedVolatility(tail(candles, analysisCandles)))
+	if err != nil {
+		return a.fail(c, err)
+	}
+	in := AIInput{Symbol: symbol, Method: method, Candles: tail(candles, analysisCandles), Quote: quote,
+		Indicators: &snap, Context: mc}
+	if preview, err := promptPreview(ctx, newAIRequest(in)); err != nil {
 		resp["preview_error"] = "AI service tidak bisa dihubungi: " + err.Error()
 	} else {
 		resp["preview"] = preview
@@ -603,6 +648,7 @@ func (a *App) AdminPrompt(c echo.Context) error {
 
 	type version struct {
 		Version      string    `json:"version"`
+		Method       string    `json:"method"`
 		Summaries    int       `json:"summaries"`
 		FirstUsed    time.Time `json:"first_used"`
 		LastUsed     time.Time `json:"last_used"`
@@ -616,7 +662,7 @@ func (a *App) AdminPrompt(c echo.Context) error {
 		FormatOKRate *float64  `json:"format_ok_rate"`
 	}
 	rows, err := a.store.pool.Query(ctx, `
-		SELECT s.prompt_version, count(*), min(s.generated_at), max(s.generated_at),
+		SELECT s.prompt_version, s.method, count(*), min(s.generated_at), max(s.generated_at),
 		       array_agg(DISTINCT s.model),
 		       count(*) FILTER (WHERE s.signal_correct IS NOT NULL),
 		       count(*) FILTER (WHERE s.signal_correct),
@@ -628,13 +674,13 @@ func (a *App) AdminPrompt(c echo.Context) error {
 		    SELECT tokens_in, tokens_out, ai_exec_ms, ai_format_ok FROM inference_log
 		    WHERE summary_id = s.id AND cache_status IN ('MISS', 'BYPASS') LIMIT 1
 		) l ON true
-		GROUP BY s.prompt_version ORDER BY max(s.generated_at) DESC`)
+		GROUP BY s.prompt_version, s.method ORDER BY max(s.generated_at) DESC, s.method`)
 	if err != nil {
 		return a.fail(c, err)
 	}
 	versions, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (version, error) {
 		var v version
-		err := r.Scan(&v.Version, &v.Summaries, &v.FirstUsed, &v.LastUsed, &v.Models, &v.Tested,
+		err := r.Scan(&v.Version, &v.Method, &v.Summaries, &v.FirstUsed, &v.LastUsed, &v.Models, &v.Tested,
 			&v.Correct, &v.NoSignal, &v.TokensInAvg, &v.TokensOutAvg, &v.ExecMSAvg, &v.FormatOKRate)
 		return v, err
 	})
@@ -737,8 +783,9 @@ func groupKey(cond string, th *float64, pg bool) string {
 	return fmt.Sprintf("%s|%v|%v", cond, f64(th), pg)
 }
 
-// GET /api/admin/evaluation?days=30&trigger=all&prompt=current|all
-// Agregasi per kondisi eksperimen: bahan tabel dan kurva trade-off Bab 4.
+// GET /api/admin/evaluation?days=30&trigger=all&prompt=current|all&method=all|debate|mtf|grounded
+// Agregasi per kondisi eksperimen: bahan tabel dan kurva trade-off Bab 4. method menyaring semua
+// metrik ke satu metode analisis (all = gabungan; satu kunjungan halaman = satu request per metode).
 func (a *App) AdminEvaluation(c echo.Context) error {
 	ctx := c.Request().Context()
 	days := queryInt(c, "days", 30, 1, 3650)
@@ -760,10 +807,17 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		}
 		prompt = q
 	}
-	// $1 hari, $2 trigger, $3 prompt; request pengguna = semua trigger kecuali scheduled.
+	method := strings.ToLower(c.QueryParam("method"))
+	if method == "" {
+		method = "all"
+	}
+	if method != "all" && method != "summary" && !validMethod(method) {
+		return badRequest(c, errors.New("method harus all, summary, atau salah satu dari "+methodsList))
+	}
+	// $1 hari, $2 trigger, $3 prompt, $4 metode; request pengguna = semua trigger kecuali scheduled.
 	const reqFilter = `created_at >= now() - make_interval(days => $1)
 		AND trigger <> 'scheduled' AND ($2 = 'all' OR trigger = $2)
-		AND ($3 = '' OR prompt_version = $3)`
+		AND ($3 = '' OR prompt_version = $3) AND ($4 = 'all' OR method = $4)`
 
 	rows, err := a.store.pool.Query(ctx, `
 		SELECT experiment_condition, invalidation_threshold_pct::float8, pregen,
@@ -796,7 +850,7 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		WHERE `+reqFilter+`
 		GROUP BY 1, 2, 3
 		ORDER BY array_position(ARRAY['no_cache','static_ttl','dynamic_ttl','event_only','hybrid'], experiment_condition), 2, 3`,
-		days, trig, prompt)
+		days, trig, prompt, method)
 	if err != nil {
 		return a.fail(c, err)
 	}
@@ -841,9 +895,10 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		       coalesce(sum(tokens_in), 0), coalesce(sum(tokens_out), 0), coalesce(sum(cost_usd), 0)::float8
 		FROM inference_log
 		WHERE created_at >= now() - make_interval(days => $1) AND ($3 = '' OR prompt_version = $3)
+		  AND ($4 = 'all' OR method = $4)
 		  AND (cache_status = 'PREGEN'
 		       OR (cache_status IN ('MISS', 'BYPASS') AND trigger <> 'scheduled' AND ($2 = 'all' OR trigger = $2)))
-		GROUP BY 1, 2, 3`, days, trig, prompt); err != nil {
+		GROUP BY 1, 2, 3`, days, trig, prompt, method); err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
@@ -868,12 +923,12 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		WITH gens AS (
 		    SELECT experiment_condition, invalidation_threshold_pct, pregen, summary_id, cache_status,
 		           coalesce(lead(created_at) OVER (
-		                        PARTITION BY experiment_condition, invalidation_threshold_pct, pregen, instrument_id
+		                        PARTITION BY experiment_condition, invalidation_threshold_pct, pregen, instrument_id, method
 		                        ORDER BY created_at),
 		                    created_at + make_interval(secs => coalesce(ttl_applied_seconds, 0))) <= now() AS ended
 		    FROM inference_log
 		    WHERE cache_status IN ('MISS', 'PREGEN') AND created_at >= now() - make_interval(days => $1)
-		      AND ($2 = '' OR prompt_version = $2)
+		      AND ($2 = '' OR prompt_version = $2) AND ($3 = 'all' OR method = $3)
 		)
 		SELECT experiment_condition, invalidation_threshold_pct::float8, pregen,
 		       count(*) FILTER (WHERE ended),
@@ -881,7 +936,7 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		           SELECT 1 FROM inference_log h
 		           WHERE h.summary_id = gens.summary_id AND h.cache_status = 'HIT' AND h.trigger <> 'scheduled'))
 		FROM gens WHERE cache_status = 'PREGEN'
-		GROUP BY 1, 2, 3`, days, prompt); err != nil {
+		GROUP BY 1, 2, 3`, days, prompt, method); err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
@@ -909,7 +964,8 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		       percentile_cont(0.95) WITHIN GROUP (ORDER BY invalidation_latency_ms)
 		FROM cache_events
 		WHERE experiment_condition IS NOT NULL AND created_at >= now() - make_interval(days => $1)
-		GROUP BY 1, 2, 3`, days); err != nil {
+		  AND ($2 = 'all' OR coalesce(method, 'summary') = $2)
+		GROUP BY 1, 2, 3`, days, method); err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
@@ -949,25 +1005,26 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 
 	type accRow struct {
 		Symbol    string   `json:"symbol"`
+		Method    string   `json:"method"`
 		Signal    string   `json:"signal"`
 		N         int      `json:"n"`
 		Correct   int      `json:"correct"`
 		AvgReturn *float64 `json:"avg_return_pct"`
 	}
 	rows, err = a.store.pool.Query(ctx, `
-		SELECT i.symbol, s.signal, count(*), count(*) FILTER (WHERE s.signal_correct),
+		SELECT i.symbol, s.method, s.signal, count(*), count(*) FILTER (WHERE s.signal_correct),
 		       avg((s.price_after_24h / s.price_at_generation - 1) * 100)::float8
 		FROM ai_summaries s JOIN instruments i ON i.id = s.instrument_id
 		WHERE s.signal_correct IS NOT NULL
 		  AND s.generated_at >= now() - make_interval(days => $1)
-		  AND ($2 = '' OR s.prompt_version = $2)
-		GROUP BY 1, 2 ORDER BY 1, 2`, days, prompt)
+		  AND ($2 = '' OR s.prompt_version = $2) AND ($3 = 'all' OR s.method = $3)
+		GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, days, prompt, method)
 	if err != nil {
 		return a.fail(c, err)
 	}
 	acc, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (accRow, error) {
 		var x accRow
-		err := r.Scan(&x.Symbol, &x.Signal, &x.N, &x.Correct, &x.AvgReturn)
+		err := r.Scan(&x.Symbol, &x.Method, &x.Signal, &x.N, &x.Correct, &x.AvgReturn)
 		return x, err
 	})
 	if err != nil {
@@ -975,7 +1032,7 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"days": days, "trigger": trig, "prompt_version": prompt, "ssr_thresholds": ssrThresholds,
+		"days": days, "trigger": trig, "prompt_version": prompt, "method": method, "ssr_thresholds": ssrThresholds,
 		"conditions": out, "accuracy": acc,
 	})
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
@@ -33,8 +34,8 @@ type MarketRow struct {
 	Volume24h     *float64   `json:"volume_24h"`       // satuan asli: lembar saham / koin
 	Turnover24h   *float64   `json:"turnover_24h"`     // nilai transaksi = sum(volume x close), dalam Currency
 	TurnoverUSD   *float64   `json:"turnover_24h_usd"` // dikonversi ke USD (kurs USDIDR_RATE), untuk mengurutkan saham dan kripto bersama
-	Signal        *string    `json:"signal"`           // BUY | SELL | HOLD dari ringkasan AI terakhir (bisa null)
-	SignalAt      *time.Time `json:"signal_at"`        // kapan ringkasan AI terakhir dibuat
+	Signal        *string    `json:"signal"`           // bias gabungan analisis AI terakhir tiap metode: BUY | SELL | HOLD | MIXED (bisa null)
+	SignalAt      *time.Time `json:"signal_at"`        // kapan analisis AI terakhir dibuat
 }
 
 const marketSQL = `
@@ -59,14 +60,19 @@ ref AS (
     ORDER BY d.instrument_id, d.ts DESC
 ),
 sig AS (
-    SELECT DISTINCT ON (instrument_id) instrument_id, signal, generated_at
-    FROM ai_summaries
-    ORDER BY instrument_id, generated_at DESC
+    -- analisis valid terakhir per metode, lalu digabung per instrument
+    SELECT instrument_id, array_remove(array_agg(signal), NULL) AS signals, max(generated_at) AS generated_at
+    FROM (
+        SELECT DISTINCT ON (instrument_id, method) instrument_id, signal, generated_at
+        FROM ai_summaries WHERE method = ANY($4::text[]) AND detail IS NOT NULL
+        ORDER BY instrument_id, method, generated_at DESC
+    ) latest
+    GROUP BY instrument_id
 )
 SELECT i.symbol, coalesce(i.name, ''), i.asset_type, i.source,
        l.close::float8, l.ts, l.fetched_at,
        r.ref_close::float8, v.volume_24h, v.turnover_24h,
-       s.signal, s.generated_at
+       s.signals, s.generated_at
 FROM instruments i
 JOIN last1h l ON l.instrument_id = i.id
 LEFT JOIN ref r ON r.instrument_id = i.id
@@ -79,7 +85,7 @@ ORDER BY i.symbol`
 
 // MarketRows: assetType ("" | stock | crypto | commodity), query (pencarian bebas), exact (satu symbol persis).
 func (s *Store) MarketRows(ctx context.Context, assetType, query, exact string) ([]MarketRow, error) {
-	rows, err := s.pool.Query(ctx, marketSQL, assetType, query, exact)
+	rows, err := s.pool.Query(ctx, marketSQL, assetType, query, exact, analysisMethods)
 	if err != nil {
 		return nil, err
 	}
@@ -89,12 +95,14 @@ func (s *Store) MarketRows(ctx context.Context, assetType, query, exact string) 
 	for rows.Next() {
 		var r MarketRow
 		var ref *float64
+		var signals []string
 		if err := rows.Scan(&r.Symbol, &r.Name, &r.AssetType, &r.Source,
 			&r.Price, &r.PriceTS, &r.FetchedAt,
 			&ref, &r.Volume24h, &r.Turnover24h,
-			&r.Signal, &r.SignalAt); err != nil {
+			&signals, &r.SignalAt); err != nil {
 			return nil, err
 		}
+		r.Signal = consensusSignal(signals)
 		if ref != nil && *ref > 0 {
 			chg := (r.Price - *ref) / *ref * 100
 			r.ChangePct = &chg
@@ -110,6 +118,23 @@ func (s *Store) MarketRows(ctx context.Context, assetType, query, exact string) 
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// consensusSignal: bias gabungan analisis terakhir tiap metode untuk tabel Home/Search.
+// Mayoritas (lebih dari separuh metode yang ada) atau MIXED kalau berbeda; nil kalau belum ada.
+func consensusSignal(signals []string) *string {
+	if len(signals) == 0 {
+		return nil
+	}
+	count := map[string]int{}
+	for _, s := range signals {
+		count[s]++
+		if count[s]*2 > len(signals) {
+			return &s
+		}
+	}
+	mixed := "MIXED"
+	return &mixed
 }
 
 func displayOf(symbol, assetType string) (display, currency string) {
@@ -168,31 +193,46 @@ func (s *Store) ChartCandles(ctx context.Context, instID int, timeframe string, 
 	return out, nil
 }
 
-// StoredSummary: ringkasan AI terakhir yang tersimpan (tanpa memanggil AI).
+// StoredSummary: analisis AI terakhir yang tersimpan untuk satu metode (tanpa memanggil AI).
 type StoredSummary struct {
-	Signal       *string   `json:"signal"`
-	Summary      string    `json:"summary"`
-	Model        string    `json:"model"`
-	GeneratedAt  time.Time `json:"generated_at"`
-	SourceDataTS time.Time `json:"source_data_ts"`
-	Support      *float64  `json:"support"`    // dari AI
-	Resistance   *float64  `json:"resistance"` // dari AI
+	Method            string          `json:"method"`
+	Signal            *string         `json:"signal"`
+	Confidence        *int            `json:"confidence"`
+	Summary           string          `json:"summary"`
+	Detail            json.RawMessage `json:"detail"`
+	Model             string          `json:"model"`
+	GeneratedAt       time.Time       `json:"generated_at"`
+	SourceDataTS      time.Time       `json:"source_data_ts"`
+	PriceAtGeneration *float64        `json:"price_at_generation"`
+	Support           *float64        `json:"support"`    // dari AI
+	Resistance        *float64        `json:"resistance"` // dari AI
 }
 
-func (s *Store) LatestSummary(ctx context.Context, instID int) (*StoredSummary, error) {
-	var out StoredSummary
-	err := s.pool.QueryRow(ctx, `
-		SELECT signal, content, model, generated_at, source_data_ts, support::float8, resistance::float8
-		FROM ai_summaries WHERE instrument_id = $1
-		ORDER BY generated_at DESC LIMIT 1`, instID).
-		Scan(&out.Signal, &out.Summary, &out.Model, &out.GeneratedAt, &out.SourceDataTS, &out.Support, &out.Resistance)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
+// LatestSummaries: analisis valid (format JSON terbaca) terakhir per metode, kunci = metode.
+func (s *Store) LatestSummaries(ctx context.Context, instID int) (map[string]*StoredSummary, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (method) method, signal, confidence, content, detail, model, generated_at,
+		       source_data_ts, price_at_generation::float8, support::float8, resistance::float8
+		FROM ai_summaries
+		WHERE instrument_id = $1 AND method = ANY($2::text[]) AND detail IS NOT NULL
+		ORDER BY method, generated_at DESC`, instID, analysisMethods)
 	if err != nil {
 		return nil, err
 	}
-	return &out, nil
+	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (*StoredSummary, error) {
+		var x StoredSummary
+		err := r.Scan(&x.Method, &x.Signal, &x.Confidence, &x.Summary, &x.Detail, &x.Model, &x.GeneratedAt,
+			&x.SourceDataTS, &x.PriceAtGeneration, &x.Support, &x.Resistance)
+		return &x, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]*StoredSummary{}
+	for _, x := range list {
+		out[x.Method] = x
+	}
+	return out, nil
 }
 
 // ---- handlers ----
@@ -315,7 +355,7 @@ func (a *App) InstrumentDetail(c echo.Context) error {
 		stats.Support, stats.Resistance = &lo, &hi
 	}
 
-	ai, err := a.store.LatestSummary(ctx, instID)
+	ai, err := a.store.LatestSummaries(ctx, instID)
 	if err != nil {
 		return a.fail(c, err)
 	}
@@ -323,7 +363,9 @@ func (a *App) InstrumentDetail(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{
 		"instrument": row,
 		"stats":      stats,
-		"ai_latest":  ai, // null kalau belum pernah dianalisis; ringkasan baru lewat /api/analyze/:symbol
+		"methods":    analysisMethods,
+		// per metode; metode yang belum pernah dianalisis tidak ada. Analisis baru lewat /api/analyze/:symbol?method=
+		"ai_latest": ai,
 	})
 }
 
@@ -452,13 +494,11 @@ func (a *App) InstrumentCandles(c echo.Context) error {
 	case "1h", "1d":
 		all, err = a.store.ChartCandles(ctx, instID, tf, n+warmup)
 	default:
-		origin := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		if at, err := a.store.AssetType(ctx, instID); err != nil {
+		var at string
+		if at, err = a.store.AssetType(ctx, instID); err != nil {
 			return a.fail(c, err)
-		} else if at == "stock" {
-			origin = origin.Add(-7 * time.Hour) // 00:00 WIB
 		}
-		all, err = a.store.AggCandles(ctx, instID, int(tfDur/time.Hour), n+warmup, origin)
+		all, err = a.store.AggCandles(ctx, instID, int(tfDur/time.Hour), n+warmup, aggOrigin(at))
 	}
 	if err != nil {
 		return a.fail(c, err)

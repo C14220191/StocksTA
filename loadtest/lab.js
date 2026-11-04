@@ -1,7 +1,8 @@
 // Skenario beban eksperimen live paralel (Bab 3.2 tahap 5: "semua kondisi pada skenario beban dan
-// data pasar yang sama"). Setiap iterasi memilih satu instrument menurut distribusi popularitas,
-// lalu mengirim request yang SAMA ke semua instance kondisi (.\ta-up.ps1 lab start) secara
-// bersamaan, sehingga setiap kondisi menerima urutan request dan kondisi pasar yang identik.
+// data pasar yang sama"). Setiap iterasi = satu kunjungan halaman Detail: satu instrument dipilih
+// menurut distribusi popularitas, lalu request untuk SETIAP metode analisis (debate, mtf, grounded)
+// dikirim ke semua instance kondisi (.\ta-up.ps1 lab start) secara bersamaan, sehingga setiap
+// kondisi menerima urutan request dan kondisi pasar yang identik.
 //
 // Pasang k6:  winget install k6 --source winget
 // Jalankan :  k6 run loadtest/lab.js
@@ -13,6 +14,7 @@
 //   PORTS     daftar port dipisah koma (default 8101-8115, sama dengan matriks lab)
 //   HOST      default 127.0.0.1 (jangan "localhost": di Windows menambah ~200 ms lewat IPv6)
 //   MIX       distribusi popularitas "SIMBOL:bobot,..." (default di bawah)
+//   METHODS   metode analisis per kunjungan, dipisah koma (default debate,mtf,grounded)
 import http from "k6/http";
 import { check } from "k6";
 
@@ -27,6 +29,7 @@ const MIX = (__ENV.MIX || "BTCUSDT:40,ETHUSDT:25,XAUUSDT:15,BBCA.JK:10,BBRI.JK:5
     return { symbol, w: Number(w) };
   });
 const TOTAL_W = MIX.reduce((s, m) => s + m.w, 0);
+const METHODS = (__ENV.METHODS || "debate,mtf,grounded").split(",").map((m) => m.trim());
 
 export const options = {
   scenarios: {
@@ -55,11 +58,16 @@ function pickSymbol() {
 
 export default function () {
   const symbol = pickSymbol();
-  const params = { headers: { "X-TA-Trigger": "k6" }, timeout: "400s", tags: { symbol } };
-  const responses = http.batch(
-    PORTS.map((port) => ["GET", `http://${HOST}:${port}/api/analyze/${symbol}`, null, { ...params, tags: { symbol, port } }])
-  );
+  const params = { headers: { "X-TA-Trigger": "k6" }, timeout: "400s" };
+  const reqs = [];
+  for (const port of PORTS) {
+    for (const method of METHODS) {
+      const url = `http://${HOST}:${port}/api/analyze/${symbol}?method=${method}`;
+      reqs.push({ port, method, req: ["GET", url, null, { ...params, tags: { symbol, port, method } }] });
+    }
+  }
+  const responses = http.batch(reqs.map((r) => r.req));
   responses.forEach((res, i) =>
-    check(res, { [`${PORTS[i]} status 200`]: (r) => r.status === 200 })
+    check(res, { [`${reqs[i].port} ${reqs[i].method} status 200`]: (r) => r.status === 200 })
   );
 }

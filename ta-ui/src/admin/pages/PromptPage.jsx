@@ -2,18 +2,22 @@ import { useState } from "react";
 import useApi from "../../lib/useApi.js";
 import { getAdminPrompt, getOverview } from "../../lib/api.js";
 import { assetLabel } from "../../lib/format.js";
-import { ErrorBox, PageHeader, Panel, Table, Td, fmtDateTime, fmtInt, fmtMs, fmtPct, fmtTokens } from "../ui.jsx";
+import { METHODS } from "../../lib/methods.js";
+import { ErrorBox, PageHeader, Panel, Segmented, Table, Td, fmtDateTime, fmtInt, fmtMs, fmtPct, fmtTokens } from "../ui.jsx";
+
+const METHOD_OPTIONS = METHODS.map((m) => ({ value: m.id, label: m.name.split(" (")[0] }));
 
 export default function PromptPage() {
   const [symbol, setSymbol] = useState("BTCUSDT");
+  const [method, setMethod] = useState(METHODS[0].id);
   const instruments = useApi((signal) => getOverview({ type: "all", limit: 50, movers: 1 }, signal), []);
-  const { data, error, loading, reload } = useApi((signal) => getAdminPrompt(symbol, signal), [symbol]);
+  const { data, error, loading, reload } = useApi((signal) => getAdminPrompt(symbol, method, signal), [symbol, method]);
   const preview = data?.preview;
-  const active = data?.versions?.find((v) => v.version === data.active_version);
+  const active = data?.versions?.find((v) => v.version === data.active_version && v.method === method);
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Prompt" subtitle="Template prompt yang dikirim ke Hermes Agent, dirender dengan data terkini">
+      <PageHeader title="Prompt" subtitle="Skill Hermes per metode dan prompt data yang dikirim, dirender dengan data terkini">
         {data && (
           <span className="rounded-full border border-line px-3 py-1 text-xs text-muted">
             Versi aktif <span className="font-semibold text-ink">{data.active_version}</span>
@@ -26,10 +30,11 @@ export default function PromptPage() {
       <div className="rounded-xl border border-hold/40 bg-panel px-5 py-4 text-xs leading-relaxed">
         <p className="font-semibold text-hold">Prompt dikunci selama eksperimen</p>
         <p className="mt-1 text-muted">
-          Mengubah prompt mengubah token dan isi ringkasan, sehingga data antar kondisi tidak sebanding lagi. Untuk mengubah:
-          edit <code className="text-ink">build_prompt</code> di <code className="text-ink">ai-service/app.py</code>, naikkan{" "}
-          <code className="text-ink">PROMPT_VERSION</code> di <code className="text-ink">run.env</code>, lalu restart. Versi lama
-          tetap tercatat di riwayat di bawah dan cache-nya otomatis tidak terpakai (versi termasuk dalam cache key).
+          Mengubah prompt atau skill mengubah token dan isi analisis, sehingga data antar kondisi tidak sebanding lagi. Untuk
+          mengubah: edit skill di <code className="text-ink">.hermes/skills/trading-analysis/</code> atau prompt data di{" "}
+          <code className="text-ink">ai-service/app.py</code>, naikkan <code className="text-ink">PROMPT_VERSION</code> di{" "}
+          <code className="text-ink">run.env</code>, lalu restart. Versi lama tetap tercatat di riwayat di bawah dan cache-nya
+          otomatis tidak terpakai (versi termasuk dalam cache key).
         </p>
       </div>
 
@@ -38,6 +43,9 @@ export default function PromptPage() {
           title="Pratinjau prompt"
           aside={preview ? `${fmtInt(preview.chars)} karakter · tanpa memanggil model (0 token)` : null}
         >
+          <div className="mb-3">
+            <Segmented label="Metode" value={method} options={METHOD_OPTIONS} onChange={setMethod} />
+          </div>
           <div className="mb-4 flex flex-wrap gap-2" role="tablist" aria-label="Instrumen untuk pratinjau">
             {(instruments.data?.top_volume ?? []).map((r) => (
               <button
@@ -64,11 +72,22 @@ export default function PromptPage() {
               {preview.prompt}
             </pre>
           )}
+          {preview?.skill_text && (
+            <details className="mt-4">
+              <summary className="cursor-pointer text-xs font-semibold text-muted hover:text-ink">
+                Isi skill <code className="text-ink">{preview.skill}</code> v{preview.skill_version} (dimuat Hermes,{" "}
+                {preview.skill_mode === "inline" ? "disisipkan ke prompt" : "preload lewat -s"})
+              </summary>
+              <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-canvas p-4 font-mono text-xs leading-relaxed">
+                {preview.skill_text}
+              </pre>
+            </details>
+          )}
           {!preview && !data?.preview_error && <div className="h-48 animate-pulse rounded-lg bg-panel-2" />}
           {active?.tokens_in_avg != null && (
             <p className="mt-3 text-xs text-muted">
-              Token input aktual rata-rata {fmtTokens(active.tokens_in_avg)} per panggilan: termasuk system prompt dan skema
-              tool Hermes (~3.000 token tetap), bukan hanya teks di atas.
+              Token input aktual rata-rata {fmtTokens(active.tokens_in_avg)} per panggilan metode ini: termasuk system prompt
+              Hermes dan isi skill, bukan hanya teks di atas.
             </p>
           )}
         </Panel>
@@ -77,14 +96,15 @@ export default function PromptPage() {
           <ul className="space-y-3 text-xs">
             {(preview?.variables ?? []).map((v) => (
               <li key={v.name}>
-                <code className="rounded bg-panel-2 px-2 py-0.5 font-mono text-ink">{`{${v.name}}`}</code>
+                <code className="rounded bg-panel-2 px-2 py-0.5 font-mono text-ink">{v.name}</code>
                 <p className="mt-1 text-muted">{v.desc}</p>
               </li>
             ))}
           </ul>
           <p className="mt-4 text-xs text-muted">
-            Output yang diminta: JSON dengan <code>summary</code> (maks. 80 kata), <code>signal</code> (BUY/SELL/HOLD),{" "}
-            <code>support</code>, <code>resistance</code>. Support/resistance di luar 0,5–1,5× harga dibuang.
+            Output: JSON sesuai format skill (rincian metode) + <code>summary</code>, <code>bias</code>{" "}
+            (bullish/bearish/neutral), <code>confidence</code>, <code>support</code>, <code>resistance</code>. Support/resistance
+            di luar 0,5–1,5× harga dibuang; output yang bukan JSON tidak di-cache.
           </p>
         </Panel>
       </div>
@@ -93,6 +113,7 @@ export default function PromptPage() {
         <Table
           head={[
             "Versi",
+            "Metode",
             "Dipakai",
             { label: "Ringkasan", right: true },
             "Model",
@@ -100,18 +121,19 @@ export default function PromptPage() {
             { label: "Token in / out", right: true },
             { label: "Durasi AI", right: true },
             { label: "JSON valid", right: true },
-            { label: "Tanpa sinyal", right: true },
+            { label: "Tanpa bias", right: true },
           ]}
           empty={data && data.versions.length === 0 ? "Belum ada ringkasan AI." : null}
         >
           {data?.versions.map((v) => (
-            <tr key={v.version}>
+            <tr key={`${v.version}-${v.method}`}>
               <Td className="font-semibold">
                 {v.version}
                 {v.version === data.active_version && (
                   <span className="ml-2 rounded-full bg-panel-2 px-2 py-0.5 text-[10px] font-semibold text-up">aktif</span>
                 )}
               </Td>
+              <Td className="text-muted">{v.method}</Td>
               <Td className="text-muted">
                 {fmtDateTime(v.first_used)} – {fmtDateTime(v.last_used)}
               </Td>

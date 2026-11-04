@@ -26,3 +26,7 @@ docs/CHECKPOINT.md
 .idea/
 Thumbs.db
 .DS_Store
+
+# Hermes: hanya project skills yang di-commit (state lain dibuat Hermes di mesin masing-masing)
+.hermes/*
+!.hermes/skills/

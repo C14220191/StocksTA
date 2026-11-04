@@ -109,7 +109,7 @@ export default function DashboardPage() {
             { label: "Request", right: true },
             { label: "Hit ratio", right: true },
             { label: "Latensi rata-rata", right: true },
-            "Sinyal terakhir",
+            "Bias terakhir",
           ]}
           empty={data && data.top_instruments.length === 0 ? "Belum ada request di periode ini." : null}
         >

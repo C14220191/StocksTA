@@ -1,12 +1,15 @@
-const COLOR = { BUY: "text-up", HOLD: "text-hold", SELL: "text-down" };
-const LABEL = { BUY: "Buy", HOLD: "Hold", SELL: "Sell" };
+import { BIAS } from "../lib/methods.js";
 
-// signal dari backend: "BUY" | "HOLD" | "SELL" | null (null = belum pernah dianalisis, tampil "-")
+// signal dari backend: "BUY" | "HOLD" | "SELL" | "MIXED" | null (null = belum pernah dianalisis, tampil "-").
+// Ditampilkan sebagai bias pasar menurut AI (Bullish/Netral/Bearish/Beragam), bukan perintah transaksi.
 export default function SignalBadge({ signal, className = "" }) {
-  const key = signal?.toUpperCase();
+  const b = BIAS[signal?.toUpperCase()];
   return (
-    <span className={`text-sm font-semibold ${COLOR[key] ?? "text-muted"} ${className}`}>
-      {LABEL[key] ?? "-"}
+    <span
+      className={`text-sm font-semibold ${b?.cls ?? "text-muted"} ${className}`}
+      title={b ? "Bias menurut analisis AI, bukan ajakan berinvestasi" : undefined}
+    >
+      {b?.label ?? "-"}
     </span>
   );
 }

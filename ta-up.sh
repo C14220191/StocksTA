@@ -9,6 +9,7 @@
 #   ./ta-up.sh stop
 #   ./ta-up.sh ingest                         # ambil data terbaru (dipanggil cron tiap jam)
 #   ./ta-up.sh backtest                       # isi price_after_24h + signal_correct (dipanggil cron)
+#   ./ta-up.sh fundamentals                   # fundamental saham dari Yahoo (cron harian)
 #   ./ta-up.sh migrate 007_thesis_metrics.sql # jalankan satu file migrations/ ke database yang sudah ada
 #
 # Studi pendahuluan (Bab 3.4):
@@ -198,6 +199,10 @@ case "$ACTION" in
     backtest)
         import_env "$ROOT/.env"
         run_py backtest.py
+        ;;
+    fundamentals)
+        import_env "$ROOT/.env"
+        run_py fundamentals.py
         ;;
     pilot-prices)
         import_env "$ROOT/.env"

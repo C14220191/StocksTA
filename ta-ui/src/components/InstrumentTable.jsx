@@ -25,7 +25,9 @@ export default function InstrumentTable({ rows, loading = false, empty = "Tidak 
             <th className={th}>Harga</th>
             <th className={`${th} text-center`}>Perubahan</th>
             <th className={`${th} text-right`}>{VOLUME_MODE === "turnover" ? "Nilai Transaksi" : "Volume"}</th>
-            <th className="w-20" />
+            <th className="w-24 px-4 py-4 text-right text-sm font-bold" title="Bias gabungan tiga analisis AI terakhir, bukan ajakan berinvestasi">
+              Bias AI
+            </th>
           </tr>
         </thead>
         <tbody>
