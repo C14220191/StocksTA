@@ -8,6 +8,7 @@
 #   .\ta-up.ps1 ingest                         # ambil data terbaru (dipanggil Task Scheduler tiap jam)
 #   .\ta-up.ps1 backtest                       # isi price_after_24h + signal_correct (boleh dijadwalkan)
 #   .\ta-up.ps1 fundamentals                   # fundamental saham dari Yahoo (harian; input metode debate/grounded)
+#   .\ta-up.ps1 quota                          # snapshot kuota langganan AI (tiap 10 menit selama eksperimen)
 #   .\ta-up.ps1 migrate 007_thesis_metrics.sql # jalankan satu file migrations\ ke database yang sudah ada
 #
 # Studi pendahuluan (Bab 3.4):
@@ -192,6 +193,11 @@ switch ($Action) {
     "fundamentals" {
         Import-EnvFile (Join-Path $Root ".env")
         Invoke-Py "fundamentals.py"
+    }
+    "quota" {
+        Import-EnvFile (Join-Path $Root ".env")
+        Import-EnvFile $RunEnv
+        Invoke-Py "quota.py"
     }
     "pilot-prices" {
         Import-EnvFile (Join-Path $Root ".env")

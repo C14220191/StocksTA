@@ -749,6 +749,11 @@ type evalRow struct {
 	NPreUnused   int      `json:"n_pre_unused"`         // ... dan tidak pernah disajikan
 	Wasted       *float64 `json:"wasted_inference_pct"` // W
 
+	// AI berlangganan (quota.go): konsumsi kuota per jendela (Session, Weekly), kapasitas, amortisasi
+	QuotaPct         map[string]float64 `json:"quota_pct,omitempty"`
+	RequestsPerQuota map[string]float64 `json:"requests_per_quota,omitempty"` // request terlayani per 100% kuota
+	SubscriptionCost *float64           `json:"subscription_cost,omitempty"`  // mata uang SUBSCRIPTION_CURRENCY
+
 	// Freshness
 	DataAgeAvg  *float64           `json:"data_age_avg_s"`
 	CacheAgeAvg *float64           `json:"cache_age_avg_s"` // pada HIT
@@ -1031,10 +1036,18 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		return a.fail(c, err)
 	}
 
-	return c.JSON(http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"days": days, "trigger": trig, "prompt_version": prompt, "method": method, "ssr_thresholds": ssrThresholds,
 		"conditions": out, "accuracy": acc,
-	})
+	}
+	// Kuota langganan: pelengkap, tidak menggagalkan evaluasi (mis. migrasi 010 belum dijalankan).
+	if quota, err := a.quotaSummary(ctx, days); err != nil {
+		resp["quota_error"] = "kuota langganan tidak bisa dibaca (migrasi 010_quota.sql sudah dijalankan?): " + truncate(err.Error(), 160)
+	} else {
+		applyQuota(out, quota)
+		resp["quota"] = quota
+	}
+	return c.JSON(http.StatusOK, resp)
 }
 
 // ---- API Health ----

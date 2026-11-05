@@ -52,9 +52,11 @@ const rowKey = (r) => `${r.condition}-${r.threshold_pct}-${r.pregen}`;
 
 // Kolom CSV = nama field API apa adanya (ssr_pct dipecah per θ_s), untuk diolah di spreadsheet / Python.
 function downloadCsv(rows, filename) {
-  const flat = rows.map(({ ssr_pct, prompt_versions, ...r }) => ({
+  const flat = rows.map(({ ssr_pct, prompt_versions, quota_pct, requests_per_quota, ...r }) => ({
     ...r,
     ...Object.fromEntries(THETA_S.map((t) => [`ssr_${t}pct`, ssr_pct?.[t] ?? null])),
+    ...Object.fromEntries(Object.entries(quota_pct ?? {}).map(([w, v]) => [`quota_${w.toLowerCase()}_pct`, v])),
+    ...Object.fromEntries(Object.entries(requests_per_quota ?? {}).map(([w, v]) => [`requests_per_100pct_${w.toLowerCase()}`, v])),
     prompt_versions: (prompt_versions ?? []).join(" "),
   }));
   const cols = Object.keys(flat[0]);
@@ -88,6 +90,79 @@ function Cond({ r }) {
       {conditionLabel(r)}
       {r.condition === "no_cache" && <span className="ml-2 text-[10px] font-normal text-muted">baseline</span>}
     </Td>
+  );
+}
+
+// AI berlangganan: biaya = konsumsi kuota (backend/quota.go). Jendela Codex: Session (5 jam), Weekly.
+function QuotaPanel({ data, rows, empty }) {
+  const q = data?.quota;
+  const windows = q?.windows ?? [];
+  const money = (v) =>
+    v == null ? "-" : new Intl.NumberFormat("id-ID", { style: "currency", currency: q.currency || "USD", maximumFractionDigits: 4 }).format(v);
+  return (
+    <Panel
+      title="2b. Kuota langganan AI"
+      aside={q ? `${q.provider}${q.plan ? ` · ${q.plan}` : ""} · dasar ${fmtTokens(q.tokens_basis)} token` : "quota_snapshots"}
+    >
+      {data?.quota_error && <p className="text-sm text-down">{data.quota_error}</p>}
+      {!q && !data?.quota_error && (
+        <p className="text-sm text-muted">
+          Belum ada snapshot kuota di periode ini. Jalankan <code className="text-ink">ta-up quota</code> tiap 10 menit selama
+          eksperimen (cron / Task Scheduler), serta tepat sebelum dan sesudah sesi uji.
+        </p>
+      )}
+      {q && (
+        <>
+          <div className="mb-4 flex flex-wrap gap-3 text-xs">
+            {windows.map((w) => (
+              <div key={w.label} className="rounded-lg bg-panel-2 px-4 py-3">
+                <div className="font-semibold text-ink">{w.label}</div>
+                <div className="mt-1 text-muted">
+                  terpakai {pct(w.consumed_pct, 2)} · {fmtInt(w.snapshots)} snapshot
+                </div>
+                <div className="text-muted">
+                  {w.pct_per_1m_tokens != null ? `${w.pct_per_1m_tokens.toFixed(3)}% per 1 juta token` : "belum bisa dihitung"}
+                </div>
+              </div>
+            ))}
+          </div>
+          {q.note && <p className="mb-3 text-xs text-hold">{q.note}</p>}
+          <Table
+            head={[
+              "Kondisi",
+              ...windows.map((w) => ({ label: `Kuota ${w.label}`, right: true })),
+              ...windows.map((w) => ({ label: `Request per 100% ${w.label}`, right: true })),
+              { label: "Biaya amortisasi", right: true },
+            ]}
+            empty={empty}
+          >
+            {rows.map((r) => (
+              <tr key={rowKey(r)}>
+                <Cond r={r} />
+                {windows.map((w) => (
+                  <Td key={`q-${w.label}`} right>
+                    {pct(r.quota_pct?.[w.label], 3)}
+                  </Td>
+                ))}
+                {windows.map((w) => (
+                  <Td key={`c-${w.label}`} right className="font-semibold">
+                    {r.requests_per_quota?.[w.label] != null ? fmtInt(Math.round(r.requests_per_quota[w.label])) : "-"}
+                  </Td>
+                ))}
+                <Td right>{money(r.subscription_cost)}</Td>
+              </tr>
+            ))}
+          </Table>
+          <p className="mt-3 text-xs text-muted">
+            Kuota kondisi = token (input + output) kondisi × persen kuota per token, dengan persen per token = kuota terpakai
+            seluruh akun ÷ token semua analisis di periode snapshot. Request per 100% = kapasitas: berapa request yang bisa
+            dilayani satu jendela penuh. Biaya amortisasi = kuota mingguan ÷ 100 × biaya langganan bulanan × 12/52
+            (SUBSCRIPTION_FEE_MONTHLY{q.fee_monthly == null ? ", belum diisi di run.env" : ""}). Asumsi: kuota sebanding dengan
+            token, dan akun tidak dipakai untuk keperluan lain selama pengukuran.
+          </p>
+        </>
+      )}
+    </Panel>
   );
 }
 
@@ -221,6 +296,8 @@ export default function EvaluationPage() {
             sudah ikut dihitung. W = entri pre-generation yang tidak pernah disajikan sampai kedaluwarsa atau tergantikan.
           </p>
         </Panel>
+
+        <QuotaPanel data={data} rows={rows} empty={empty} />
 
         <Panel title="3. Freshness" aside="D_serve, SSR, dan SFR dihitung pada setiap cache HIT">
           <Table

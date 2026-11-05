@@ -182,6 +182,52 @@ func TestAIRequestFieldNames(t *testing.T) {
 	}
 }
 
+func TestQuotaConsumed(t *testing.T) {
+	t0 := time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC)
+	r1, r2 := t0.Add(5*time.Hour), t0.Add(10*time.Hour)
+	pts := []quotaPoint{
+		{At: t0, Used: 10, ResetsAt: &r1},
+		{At: t0.Add(time.Hour), Used: 25, ResetsAt: &r1},
+		{At: t0.Add(2 * time.Hour), Used: 40, ResetsAt: &r1},
+		{At: t0.Add(6 * time.Hour), Used: 5, ResetsAt: &r2}, // reset: 5% terpakai sejak reset
+		{At: t0.Add(7 * time.Hour), Used: 12, ResetsAt: &r2},
+	}
+	if got := quotaConsumed(pts); got != 15+15+5+7 {
+		t.Errorf("consumed = %v, mau 42", got)
+	}
+	// reset terdeteksi dari pergeseran resets_at walau persen naik (pemakaian setelah reset lebih besar)
+	pts2 := []quotaPoint{{At: t0, Used: 10, ResetsAt: &r1}, {At: t0.Add(6 * time.Hour), Used: 30, ResetsAt: &r2}}
+	if got := quotaConsumed(pts2); got != 30 {
+		t.Errorf("reset lewat resets_at: %v, mau 30", got)
+	}
+	if quotaConsumed(pts[:1]) != 0 {
+		t.Error("satu snapshot = 0")
+	}
+}
+
+func TestApplyQuota(t *testing.T) {
+	fee := 20.0
+	q := &quotaInfo{FeeMonthly: &fee, TokensBasis: 1_000_000, Windows: []quotaWindow{
+		{Label: "Session", ConsumedPct: 50, pctPerToken: 50.0 / 1e6},
+		{Label: "Weekly", ConsumedPct: 10, pctPerToken: 10.0 / 1e6},
+	}}
+	nc := &evalRow{Condition: "no_cache", Requests: 100, TokensIn: 300_000, TokensOut: 100_000}
+	hy := &evalRow{Condition: "hybrid", Requests: 100, TokensIn: 30_000, TokensOut: 10_000}
+	applyQuota([]*evalRow{nc, hy}, q)
+	if math.Abs(nc.QuotaPct["Session"]-20) > 1e-9 || math.Abs(hy.QuotaPct["Weekly"]-0.4) > 1e-9 {
+		t.Errorf("quota pct: %v / %v", nc.QuotaPct, hy.QuotaPct)
+	}
+	// kapasitas: 100 request memakai 20% sesi -> 500 request per 100%
+	if math.Abs(nc.RequestsPerQuota["Session"]-500) > 1e-9 || math.Abs(hy.RequestsPerQuota["Session"]-5000) > 1e-9 {
+		t.Errorf("kapasitas: %v / %v", nc.RequestsPerQuota, hy.RequestsPerQuota)
+	}
+	// amortisasi: 4% kuota mingguan x $20 x 12/52
+	if want := 0.04 * 20 * 12 / 52; nc.SubscriptionCost == nil || math.Abs(*nc.SubscriptionCost-want) > 1e-12 {
+		t.Errorf("biaya = %v, mau %v", nc.SubscriptionCost, want)
+	}
+	applyQuota([]*evalRow{nc}, nil) // tanpa snapshot: tidak panik
+}
+
 func TestStubDetailShape(t *testing.T) {
 	for _, m := range analysisMethods {
 		var d map[string]any

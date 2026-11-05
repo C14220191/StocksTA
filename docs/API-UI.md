@@ -179,7 +179,7 @@ Tanpa autentikasi: backend hanya listen di `127.0.0.1`, akses dari mesin yang sa
 | Prompt | `GET /api/admin/prompt?symbol=BTCUSDT&method=debate\|mtf\|grounded` | Prompt data satu metode dirender dengan data terkini lewat `POST /prompt/preview` di AI service (tanpa memanggil model) + isi skill Hermes-nya, riwayat versi prompt per metode + akurasi backtest |
 | Cache & Job | `GET /api/admin/cache` | Status cache per instrumen (Redis + sisa TTL + deviasi harga), invalidasi terakhir, job terjadwal dari `job_runs`, antrean Hermes |
 | Cache & Job | `POST /api/admin/cache/:symbol/invalidate?method=` | Buang cache satu instrumen (satu metode, atau semua kalau `method` kosong), dicatat di `cache_events` dengan reason `manual` |
-| Evaluasi | `GET /api/admin/evaluation?days=30&trigger=all\|k6\|ui\|pilot\|manual&prompt=current\|stub\|all&method=all\|debate\|mtf\|grounded` | Metrik Bab 2.7 per kondisi × θ × pregen: H, latency p50/p95/p99, N_gen, N_pre, S, W, D_serve, SSR (θ_s 1/2/5/10), SFR, L_inv + akurasi backtest |
+| Evaluasi | `GET /api/admin/evaluation?days=30&trigger=all\|k6\|ui\|pilot\|manual&prompt=current\|stub\|all&method=all\|debate\|mtf\|grounded` | Metrik Bab 2.7 per kondisi × θ × pregen: H, latency p50/p95/p99, N_gen, N_pre, S, W, D_serve, SSR (θ_s 1/2/5/10), SFR, L_inv + akurasi backtest. `quota` (AI berlangganan): kuota terpakai per jendela dari `quota_snapshots`, per kondisi `quota_pct`, `requests_per_quota` (kapasitas per 100%), `subscription_cost` (amortisasi) |
 | API Health | `GET /api/admin/health` | PostgreSQL, Redis, AI service, price feed spot/futures, ingestion per sumber, log kesalahan 7 hari |
 
 `job_runs` (migrasi 006) diisi oleh `ingest.py` dan `backtest.py`, satu baris per job per instrumen.
