@@ -15,7 +15,7 @@
 #
 # Studi pendahuluan (Bab 3.4):
 #   ./ta-up.sh pilot-prices
-#   ./ta-up.sh pilot-ai [N]                   # backend harus no_cache
+#   ./ta-up.sh pilot-ai [N] [SIMBOL,...]      # backend harus no_cache (./ta-up.sh restart no_cache http)
 #
 # Eksperimen live paralel: semua kondisi berjalan bersamaan di port 8101-8115, satu AI service.
 #   ./ta-up.sh lab start [stub|http]          # default stub (tanpa token)
@@ -176,6 +176,10 @@ case "$ACTION" in
         if [[ -n "$ARG4" ]]; then
             [[ "$ARG4" =~ ^(on|off)$ ]] || die "PREGEN harus on atau off: $ARG4"
             set_run_env PREGEN "$ARG4"
+        elif [[ "$ARG1" == "no_cache" ]]; then
+            # no_cache tidak punya cache untuk diisi pre-generation; backend menolak kombinasi ini
+            set_run_env PREGEN off
+            echo "PREGEN dimatikan (no_cache tanpa cache). Kembali: ./ta-up.sh restart hybrid http 2 on"
         fi
         stop_services
         sleep 1
@@ -187,6 +191,10 @@ case "$ACTION" in
             sleep 1
         done
         show_status
+        if [[ "$(health http://127.0.0.1:8080/health)" == "DOWN" ]]; then
+            echo "--- backend gagal start, logs/backend.err.log:"
+            tail -n 5 "$LOG_DIR/backend.err.log"
+        fi
         ;;
     stop)
         stop_services
@@ -215,7 +223,12 @@ case "$ACTION" in
         run_py pilot_prices.py --csv "$LOG_DIR/pilot_prices.csv"
         ;;
     pilot-ai)
-        run_py pilot_ai.py --n "${ARG1:-10}" --csv "$LOG_DIR/pilot_ai.csv"
+        # ./ta-up.sh pilot-ai [N] [SIMBOL,SIMBOL,...]  (default: semua instrument x 3 metode)
+        if [[ -n "$ARG2" ]]; then
+            run_py pilot_ai.py --n "${ARG1:-10}" --symbols "$ARG2" --csv "$LOG_DIR/pilot_ai.csv"
+        else
+            run_py pilot_ai.py --n "${ARG1:-10}" --csv "$LOG_DIR/pilot_ai.csv"
+        fi
         ;;
     migrate)
         # Lewat stdin, jadi tidak bergantung pada folder yang di-mount container.

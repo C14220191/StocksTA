@@ -170,6 +170,10 @@ switch ($Action) {
         if ($Pregen) {
             if ($Pregen -notmatch '^(on|off)$') { throw "PREGEN harus on atau off: $Pregen" }
             Set-RunEnv "PREGEN" $Pregen
+        } elseif ($CacheMode -eq "no_cache") {
+            # no_cache tidak punya cache untuk diisi pre-generation; backend menolak kombinasi ini
+            Set-RunEnv "PREGEN" "off"
+            Write-Host "PREGEN dimatikan (no_cache tanpa cache). Kembali: .\ta-up.ps1 restart hybrid http 2 on"
         }
         Stop-Services
         Start-Sleep -Seconds 1
@@ -179,6 +183,10 @@ switch ($Action) {
             Start-Sleep -Seconds 1
         }
         Show-Status
+        if ((Get-Health "http://127.0.0.1:8080/health") -eq "DOWN") {
+            Write-Host "--- backend gagal start, logs\backend.err.log:"
+            Get-Content (Join-Path $LogDir "backend.err.log") -Tail 5
+        }
     }
     "stop"   { Stop-Services; Write-Host "stopped" }
     "ingest" {
@@ -204,8 +212,11 @@ switch ($Action) {
         Invoke-Py "pilot_prices.py" "--csv", (Join-Path $LogDir "pilot_prices.csv")
     }
     "pilot-ai" {
+        # .\ta-up.ps1 pilot-ai [N] [SIMBOL,SIMBOL,...]  (default: semua instrument x 3 metode)
         $n = if ($CacheMode) { $CacheMode } else { "10" }
-        Invoke-Py "pilot_ai.py" "--n", $n, "--csv", (Join-Path $LogDir "pilot_ai.csv")
+        $pyArgs = @("--n", $n, "--csv", (Join-Path $LogDir "pilot_ai.csv"))
+        if ($AiMode) { $pyArgs += @("--symbols", $AiMode) }
+        Invoke-Py "pilot_ai.py" $pyArgs
     }
     "migrate" {
         # Lewat stdin, jadi tidak bergantung pada folder yang di-mount container.
