@@ -30,6 +30,20 @@ class LoadJSON(unittest.TestCase):
         self.assertEqual(data["confluence"]["score"], 2)
         self.assertEqual(data["bias"], "bearish")
 
+    def test_missing_final_brace_keeps_tail(self):
+        # pola nyata (5 Nov, debate BBCA): array analysts tidak ditutup DAN '}' penutup tidak ada;
+        # memotong di '}' terakhir akan membuang bias dan summary
+        raw = ('{"analysts":[{"role":"technical","signal":"bearish","confidence":60,"reason":"r"},'
+               '"debate":[{"round":1,"bull":"a","bear":"b"}],"risk":{"worst_case":"w"},"volatility":"v",'
+               '"bias":"neutral","confidence":45,"summary":"kesimpulan netral."')
+        data, repaired = app._load_json(raw)
+        self.assertTrue(repaired)
+        self.assertEqual(data["bias"], "neutral")
+        self.assertEqual(data["summary"], "kesimpulan netral.")
+        out = app.parse_output(raw, 105, "debate")
+        self.assertTrue(out["format_ok"])
+        self.assertEqual(out["detail"]["risk"]["volatility"], "v")  # dipindah dari luar objek risk
+
     def test_close_arrays_ignores_colon_in_strings(self):
         s = '{"a":["x: y", "b"],"c":1}'
         self.assertEqual(app._close_arrays(s), s)
@@ -80,6 +94,13 @@ class ParseOutput(unittest.TestCase):
         raw = json.dumps({"bias": "bullish", "summary": "Entry di 100 dengan stop loss 95."})
         d = app.parse_output(raw, 105, "grounded")["detail"]
         self.assertEqual(d["advice_terms"], ["entry", "stop loss"])
+
+    def test_valid_json_without_conclusion_is_invalid(self):
+        out = app.parse_output(json.dumps({"analysts": [], "summary": "s"}), 105, "debate")  # tanpa bias
+        self.assertFalse(out["format_ok"])
+        out = app.parse_output(json.dumps({"bias": "maybe", "summary": "s"}), 105, "mtf")  # bias tidak dikenal
+        self.assertFalse(out["format_ok"])
+        self.assertIsNone(out["detail"])
 
     def test_invalid_json_keeps_text(self):
         out = app.parse_output("maaf, tidak bisa", 105, "debate")

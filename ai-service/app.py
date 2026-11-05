@@ -432,10 +432,13 @@ def normalize_debate(d: dict) -> dict:
     risk = d.get("risk")
     if not isinstance(risk, dict):
         risk = {"worst_case": risk}
+    # model kecil kadang menaruh worst_case / volatility di luar objek risk
+    worst = risk.get("worst_case") or d.get("worst_case")
+    volatility = risk.get("volatility") or d.get("volatility")
     return {
         "analysts": analysts,
         "debate": rounds[:3],
-        "risk": {"worst_case": _text(risk.get("worst_case"), 400), "volatility": _text(risk.get("volatility"), 300)},
+        "risk": {"worst_case": _text(worst, 400), "volatility": _text(volatility, 300)},
         "change_conditions": _texts(d.get("change_conditions"), 4, 250),
         "missing_data": _texts(d.get("missing_data"), 6, 200),
     }
@@ -536,31 +539,34 @@ def _load_json(text: str) -> tuple[dict | None, bool]:
     if start < 0:
         return None, False
     end = text.rfind("}")
-    candidate = text[start:end + 1] if end > start else text[start:]
+    strict = text[start:end + 1] if end > start else text[start:]
     try:
-        data = json.loads(candidate)
+        data = json.loads(strict)
         return (data, False) if isinstance(data, dict) else (None, False)
     except ValueError:
         pass
-    candidate = _close_arrays(candidate)
-    try:
-        data = json.loads(candidate)
-    except ValueError:
+    # Perbaikan dicoba dulu pada seluruh teks sejak '{': model kecil kadang berhenti tanpa '}' penutup,
+    # sehingga memotong di '}' terakhir justru membuang kunci kesimpulan (bias, summary) di ekor jawaban
+    # (uji 5 Nov, debate BBCA).
+    for candidate in (_close_arrays(text[start:].strip()), _close_arrays(strict)):
         try:
-            data = json_repair.loads(candidate)
-        except Exception:  # noqa: BLE001 - library pihak ketiga, apa pun gagalnya dianggap bukan JSON
-            return None, False
-    if isinstance(data, list):  # objek terpotong jadi beberapa bagian: ambil yang membawa kesimpulan
-        data = next((d for d in data if isinstance(d, dict) and ("summary" in d or "bias" in d)), None)
-    if isinstance(data, dict) and ("summary" in data or "bias" in data):
-        return data, True
+            data = json.loads(candidate)
+        except ValueError:
+            try:
+                data = json_repair.loads(candidate)
+            except Exception:  # noqa: BLE001 - library pihak ketiga, apa pun gagalnya dianggap bukan JSON
+                continue
+        if isinstance(data, list):  # objek terpotong jadi beberapa bagian: ambil yang membawa kesimpulan
+            data = next((d for d in data if isinstance(d, dict) and ("summary" in d or "bias" in d)), None)
+        if isinstance(data, dict) and ("summary" in data or "bias" in data):
+            return data, True
     return None, False
 
 
 def parse_output(text: str, ref_price: float, method: str) -> dict:
     """Pisahkan output Hermes menjadi kolom umum (summary, bias, confidence, support, resistance)
     dan detail terstruktur per metode. Kalau JSON gagal dibaca, teks apa adanya disimpan."""
-    out = {"content": text[:2000], "signal": "", "confidence": None, "support": None, "resistance": None,
+    out = {"content": text[:6000], "signal": "", "confidence": None, "support": None, "resistance": None,
            "detail": None, "format_ok": False}
     lo, hi = ref_price * 0.5, ref_price * 1.5
     data, repaired = _load_json(text)
@@ -569,6 +575,11 @@ def parse_output(text: str, ref_price: float, method: str) -> dict:
         return out
 
     bias = _bias(data.get("bias"))
+    summary = _text(data.get("summary"), 800)
+    if not bias or not summary:
+        # JSON terbaca tapi tanpa kesimpulan: tidak memenuhi format skill, diperlakukan sebagai gagal format
+        log.warning("output Hermes (%s) tanpa bias/summary: %s", method, text[:200])
+        return out
     detail = {"debate": normalize_debate, "grounded": normalize_grounded}.get(method)
     detail = detail(data) if detail else normalize_mtf(data, lo, hi)
     detail["bias"] = bias or None
@@ -579,9 +590,8 @@ def parse_output(text: str, ref_price: float, method: str) -> dict:
         detail["advice_terms"] = terms
         log.warning("output %s memuat istilah ajakan transaksi: %s", method, terms)
 
-    out.update(format_ok=True, detail=detail, signal=SIGNAL_OF_BIAS.get(bias, ""),
-               confidence=_conf(data.get("confidence")),
-               content=_text(data.get("summary"), 800) or text[:2000],
+    out.update(format_ok=True, detail=detail, signal=SIGNAL_OF_BIAS[bias],
+               confidence=_conf(data.get("confidence")), content=summary,
                support=_level(data.get("support"), lo, hi), resistance=_level(data.get("resistance"), lo, hi))
     # Level yang tidak masuk akal dibuang (bukan diperbaiki), supaya UI tidak menampilkan angka salah.
     if out["support"] is not None and out["resistance"] is not None and out["support"] >= out["resistance"]:
