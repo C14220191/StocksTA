@@ -1,7 +1,9 @@
 """Unit test parser output dan prompt builder (tanpa memanggil Hermes).
 Jalankan dari folder ai-service:  python -m unittest test_app"""
 import json
+import re
 import unittest
+from pathlib import Path
 
 import app
 
@@ -47,6 +49,39 @@ class LoadJSON(unittest.TestCase):
     def test_close_arrays_ignores_colon_in_strings(self):
         s = '{"a":["x: y", "b"],"c":1}'
         self.assertEqual(app._close_arrays(s), s)
+
+    def test_split_object_merged(self):
+        s = '{"sc":{"bull":"a"},{"bear":"b, }"} , {"inv":"c"},"lvl":1}'
+        self.assertEqual(json.loads(app._close_arrays(s)), {"sc": {"bull": "a", "bear": "b, }", "inv": "c"}, "lvl": 1})
+        arr = '{"a":[{"x":1},{"y":2}],"b":{"c":1}}'  # objek berurutan di dalam array itu sah: tidak diubah
+        self.assertEqual(app._close_arrays(arr), arr)
+
+    def test_conclusion_hoisted_from_array(self):
+        # JSON sah secara sintaks, tetapi kesimpulan berada di dalam array timeframes
+        raw = json.dumps({"timeframes": [{"tf": "1D"}, {"confluence": {"score": 1}, "bias": "bearish", "summary": "s"}]})
+        data, repaired = app._load_json(raw)
+        self.assertTrue(repaired)
+        self.assertEqual((data["bias"], data["summary"]), ("bearish", "s"))
+        self.assertEqual(data["timeframes"], [{"tf": "1D"}])
+
+    def test_pilot_mtf_failures(self):
+        # output asli pilot 5 Nov di server yang sebelumnya format_ok = false (log 271, 264, 262)
+        raw = (Path(__file__).parent / "testdata" / "mtf_invalid_pilot.txt").read_text(encoding="utf-8")
+        parts = re.split(r"^=== log (\d+) .*\n", raw, flags=re.M)[1:]
+        cases = dict(zip(parts[::2], (p.strip() for p in parts[1::2])))
+        self.assertEqual(sorted(cases), ["262", "264", "271"])
+        for log_id, body in cases.items():
+            with self.subTest(log=log_id):
+                out = app.parse_output(body, 2000, "mtf")
+                self.assertTrue(out["format_ok"])
+                d = out["detail"]
+                self.assertTrue(d["json_repaired"])
+                self.assertEqual([t["tf"] for t in d["timeframes"]], ["1D", "4H", "1H"])
+                self.assertTrue(all(d["scenarios"].values()))
+                self.assertIsNotNone(d["invalidation_level"])
+        out = app.parse_output(cases["264"], 2350, "mtf")  # 1H kedua (karangan model) diabaikan
+        self.assertEqual(out["detail"]["timeframes"][2]["trend"], "turun")
+        self.assertEqual(out["signal"], "SELL")
 
     def test_not_json(self):
         self.assertEqual(app._load_json('{:signal "neutral", :confidence 0}'), (None, False))

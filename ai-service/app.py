@@ -449,13 +449,15 @@ FACTORS = ("trend", "structure", "level", "rsi", "volume")
 
 
 def normalize_mtf(d: dict, lo: float, hi: float) -> dict:
-    tfs = []
+    tfs, seen = [], set()
     for t in d.get("timeframes") or []:
         if not isinstance(t, dict):
             continue
         tf = str(t.get("tf", "")).upper()
-        if tf not in ("1D", "4H", "1H"):
+        # timeframe karangan model (60M, 15M, ...) dibuang; tf yang berulang hanya diambil yang pertama
+        if tf not in ("1D", "4H", "1H") or tf in seen:
             continue
+        seen.add(tf)
         tfs.append({"tf": tf, "trend": TREND.get(str(t.get("trend", "")).lower(), _text(t.get("trend"), 20)),
                     "structure": _text(t.get("structure"), 20),
                     "aligned": True if tf == "1D" else _bool(t.get("aligned")),
@@ -498,10 +500,26 @@ def normalize_grounded(d: dict) -> dict:
     }
 
 
+def _comma_after_close(out: list[str]) -> int:
+    """Indeks '}' di out kalau out berakhir dengan '}' lalu ',' (spasi diabaikan), selain itu -1."""
+    j = len(out) - 1
+    while j >= 0 and out[j].isspace():
+        j -= 1
+    if j < 0 or out[j] != ",":
+        return -1
+    j -= 1
+    while j >= 0 and out[j].isspace():
+        j -= 1
+    return j if j >= 0 and out[j] == "}" else -1
+
+
 def _close_arrays(s: str) -> str:
-    """Model kecil sering lupa menutup array sebelum kunci berikutnya, mis.
-    {"timeframes":[{...},{...},"confluence":{...}}. Kunci objek yang muncul langsung di dalam array
-    berarti array itu seharusnya sudah ditutup: sisipkan ']' sebelum kunci tersebut."""
+    """Perbaiki dua kesalahan struktur yang sering dibuat model kecil:
+    1. Lupa menutup array sebelum kunci berikutnya, mis. {"timeframes":[{...},{...},"confluence":{...}}.
+       Kunci objek yang muncul langsung di dalam array berarti array itu seharusnya sudah ditutup:
+       sisipkan ']' sebelum kunci tersebut.
+    2. Memecah satu objek menjadi beberapa, mis. "scenarios":{"bullish":".."},{"bearish":".."}
+       (pilot 5 Nov, mtf ANTM). '{' di posisi kunci objek tidak sah: '},{' digabung kembali menjadi ','."""
     out, stack, i, n = [], [], 0, len(s)
     while i < n:
         ch = s[i]
@@ -521,6 +539,11 @@ def _close_arrays(s: str) -> str:
             out.append(s[i:j + 1])
             i = j + 1
             continue
+        if ch == "{" and stack and stack[-1] == "{" and (k := _comma_after_close(out)) >= 0:
+            del out[k]           # buang '}' yang menutup objek sebelumnya, koma dipertahankan
+            stack.append("{")    # objek itu dibuka lagi; '{' ini sendiri tidak ditulis
+            i += 1
+            continue
         if ch in "[{":
             stack.append(ch)
         elif ch in "]}" and stack:
@@ -530,11 +553,35 @@ def _close_arrays(s: str) -> str:
     return "".join(out)
 
 
+def _has_conclusion(d) -> bool:
+    return isinstance(d, dict) and ("summary" in d or "bias" in d)
+
+
+def _hoist_conclusion(data: dict) -> bool:
+    """Model kecil kadang menulis '},{"confluence":...' alih-alih '}],"confluence":...', sehingga seluruh
+    bagian penutup jawaban (confluence ... bias, summary) menjadi elemen terakhir array timeframes
+    (pilot 5 Nov, mtf). Elemen array yang membawa kesimpulan dipindah kembali ke tingkat atas.
+    True kalau ada yang dipindah."""
+    if _has_conclusion(data):
+        return False
+    for key, val in list(data.items()):
+        if not isinstance(val, list):
+            continue
+        for i, el in enumerate(val):
+            if _has_conclusion(el):
+                data[key] = val[:i] + val[i + 1:]
+                for k, v in el.items():
+                    data.setdefault(k, v)
+                return True
+    return False
+
+
 def _load_json(text: str) -> tuple[dict | None, bool]:
     """Objek JSON dari output model. Kalau json.loads gagal (model kecil sering menulis kutip ganda
-    berlebih, lupa menutup array, atau berhenti di tengah), dicoba perbaikan: _close_arrays lalu
-    json_repair. Hasil perbaikan hanya diterima kalau berupa objek dengan kunci format skill
-    (summary / bias). Kembalian: (data, diperbaiki?)."""
+    berlebih, lupa menutup array, memecah objek, atau berhenti di tengah), dicoba perbaikan:
+    _close_arrays lalu json_repair. Hasil hanya diterima kalau berupa objek dengan kunci format skill
+    (summary / bias), setelah kesimpulan yang tersesat ke dalam array dipindah ke tingkat atas.
+    Kembalian: (data, diperbaiki?)."""
     start = text.find("{")
     if start < 0:
         return None, False
@@ -542,7 +589,9 @@ def _load_json(text: str) -> tuple[dict | None, bool]:
     strict = text[start:end + 1] if end > start else text[start:]
     try:
         data = json.loads(strict)
-        return (data, False) if isinstance(data, dict) else (None, False)
+        if not isinstance(data, dict):
+            return None, False
+        return data, _hoist_conclusion(data)
     except ValueError:
         pass
     # Perbaikan dicoba dulu pada seluruh teks sejak '{': model kecil kadang berhenti tanpa '}' penutup,
@@ -557,9 +606,11 @@ def _load_json(text: str) -> tuple[dict | None, bool]:
             except Exception:  # noqa: BLE001 - library pihak ketiga, apa pun gagalnya dianggap bukan JSON
                 continue
         if isinstance(data, list):  # objek terpotong jadi beberapa bagian: ambil yang membawa kesimpulan
-            data = next((d for d in data if isinstance(d, dict) and ("summary" in d or "bias" in d)), None)
-        if isinstance(data, dict) and ("summary" in data or "bias" in data):
-            return data, True
+            data = next((d for d in data if _has_conclusion(d)), None)
+        if isinstance(data, dict):
+            _hoist_conclusion(data)
+            if _has_conclusion(data):
+                return data, True
     return None, False
 
 

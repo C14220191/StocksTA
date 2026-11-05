@@ -31,8 +31,8 @@ from pathlib import Path
 import requests
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
-FIELDS = ["run", "symbol", "asset_type", "method", "ok", "format_ok", "wall_ms", "latency_ms", "tokens_in",
-          "tokens_out", "cache_read_tokens", "cost_usd", "error"]
+FIELDS = ["run", "symbol", "asset_type", "method", "ok", "format_ok", "json_repaired", "wall_ms", "latency_ms",
+          "tokens_in", "tokens_out", "cache_read_tokens", "cost_usd", "error"]
 HEADERS = {"X-TA-Trigger": "pilot"}
 
 
@@ -85,6 +85,7 @@ def load_csv(path):
             for k in ("wall_ms", "latency_ms", "tokens_in", "tokens_out", "cache_read_tokens", "cost_usd"):
                 r[k] = num(r.get(k))
             r["ok"], r["format_ok"] = flag(r["ok"]), flag(r.get("format_ok"))
+            r["json_repaired"] = flag(r.get("json_repaired"))  # None untuk CSV lama tanpa kolom ini
             rows.append(r)
     return rows
 
@@ -115,7 +116,9 @@ def report(rows, args):
         if not g:
             continue
         valid = sum(1 for r in g if r["format_ok"] is not False)
-        print(f"\n{at} · {method} (n={len(g)}, JSON valid {valid}/{len(g)} = {valid / len(g):.0%})")
+        repaired = sum(1 for r in g if r["format_ok"] is not False and r.get("json_repaired"))
+        print(f"\n{at} · {method} (n={len(g)}, JSON valid {valid}/{len(g)} = {valid / len(g):.0%}, "
+              f"{repaired} di antaranya lewat perbaikan parser)")
         print(f"  latency ms : {summary([r['latency_ms'] for r in g])}")
         print(f"  T_in total : {summary([(r['tokens_in'] or 0) + (r['cache_read_tokens'] or 0) for r in g])}")
         print(f"   cache_read: {summary([r['cache_read_tokens'] or 0 for r in g])}")
@@ -184,8 +187,11 @@ def main():
                 except Exception as e:  # catat dan lanjut
                     d, ok = {"error": str(e)}, False
                 wall = (time.monotonic() - t0) * 1000
+                det = d.get("detail")
                 row = {"run": k + 1, "symbol": sym, "asset_type": at, "method": method, "ok": ok,
-                       "format_ok": d.get("format_ok"), "wall_ms": round(wall),
+                       "format_ok": d.get("format_ok"),
+                       "json_repaired": isinstance(det, dict) and bool(det.get("json_repaired")),
+                       "wall_ms": round(wall),
                        "latency_ms": d.get("latency_ms"), "tokens_in": d.get("tokens_in"),
                        "tokens_out": d.get("tokens_out"), "cache_read_tokens": d.get("cache_read_tokens"),
                        "cost_usd": d.get("cost_usd"), "error": d.get("error", "")}
@@ -197,6 +203,7 @@ def main():
                       f"{row['latency_ms'] or round(wall):>6} ms  in {row['tokens_in'] or 0:>5}"
                       f" +cache {row['cache_read_tokens'] or 0:>5}  out {row['tokens_out'] or 0:>4}"
                       f"{'' if row['format_ok'] is not False else '  (JSON tidak valid)'}"
+                      f"{'  (diperbaiki parser)' if row['json_repaired'] else ''}"
                       f"{'' if ok else '  ' + str(row['error'])[:80]}")
                 time.sleep(args.pause)
 
