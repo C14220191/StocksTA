@@ -15,7 +15,7 @@
 #
 # Studi pendahuluan (Bab 3.4):
 #   ./ta-up.sh pilot-prices
-#   ./ta-up.sh pilot-ai [N] [SIMBOL,...]      # backend harus no_cache (./ta-up.sh restart no_cache http)
+#   ./ta-up.sh pilot-ai [N] [SIMBOL,...]      # background; backend harus no_cache (./ta-up.sh restart no_cache http)
 #
 # Eksperimen live paralel: semua kondisi berjalan bersamaan di port 8101-8115, satu AI service.
 #   ./ta-up.sh lab start [stub|http]          # default stub (tanpa token)
@@ -224,11 +224,20 @@ case "$ACTION" in
         ;;
     pilot-ai)
         # ./ta-up.sh pilot-ai [N] [SIMBOL,SIMBOL,...]  (default: semua instrument x 3 metode)
-        if [[ -n "$ARG2" ]]; then
-            run_py pilot_ai.py --n "${ARG1:-10}" --symbols "$ARG2" --csv "$LOG_DIR/pilot_ai.csv"
-        else
-            run_py pilot_ai.py --n "${ARG1:-10}" --csv "$LOG_DIR/pilot_ai.csv"
+        # Berjalan di background (aman ditinggal / SSH putus). Progres: tail -f logs/pilot_ai.out
+        # Ditolak kalau pilot lain masih berjalan: dua pilot bersamaan saling antre di Hermes
+        # sehingga latency ikut memuat waktu antre, dan output/CSV-nya saling menimpa.
+        if ! flock -n "$LOG_DIR/pilot_ai.lock" true; then
+            die "Pilot lain masih berjalan (ps aux | grep [p]ilot_ai). Tunggu selesai atau: pkill -f pilot_ai.py"
         fi
+        pilot_args=(--n "${ARG1:-10}" --csv "$LOG_DIR/pilot_ai.csv")
+        if [[ -n "$ARG2" ]]; then
+            pilot_args+=(--symbols "$ARG2")
+        fi
+        PYTHONWARNINGS=ignore nohup "$PYTHON" -u "$ROOT/ingestion/pilot_ai.py" "${pilot_args[@]}" \
+            < /dev/null > "$LOG_DIR/pilot_ai.out" 2>&1 &
+        echo "pilot berjalan di background (PID $!)."
+        echo "Pantau: tail -f logs/pilot_ai.out   (Ctrl+C hanya menutup tampilan, pilot tetap jalan)"
         ;;
     migrate)
         # Lewat stdin, jadi tidak bergantung pada folder yang di-mount container.
