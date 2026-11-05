@@ -42,6 +42,11 @@ export const options = {
       maxVUs: 200,
     },
   },
+  // Semua request satu kunjungan (15 port x 3 metode = 45) harus berangkat bersamaan supaya setiap kondisi
+  // menerima request pada saat dan kondisi pasar yang sama. Default k6 hanya 10 paralel per batch (6 per
+  // host): dengan latency AI realistis (stub profil pilot 12-22 dtk) sisanya antre puluhan detik.
+  batch: 64,
+  batchPerHost: 64,
   // Latency yang dianalisis adalah latency_ms di inference_log (diukur di backend); metrik k6
   // hanya pelengkap. Request lama (no_cache dengan AI sungguhan) jangan diputus.
   httpDebug: "",

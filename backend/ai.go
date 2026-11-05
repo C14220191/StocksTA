@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -17,13 +20,30 @@ const (
 	stubPriceOutPerM = 0.60
 )
 
-// stubTokens: token rata-rata per metode dari uji Hermes sungguhan (4 Nov 2026,
-// upstage/solar-mini4:free, toolset context_engine, BTC/ETH/BBCA), supaya biaya relatif antar
-// metode di lab stub mendekati kenyataan. Kalibrasi final tetap dari pilot-ai.
-var stubTokens = map[string][2]int{ // {input, output}
-	"debate":   {3000, 1050},
-	"mtf":      {4850, 450},
-	"grounded": {3000, 1100},
+// stubProfile: perilaku Hermes per metode yang ditiru stub di lab.
+type stubProfile struct {
+	tokensIn, tokensOut  int     // rata-rata; input = tokens_in + cache_read_tokens
+	latencyMS, latencySD float64 // mean dan simpangan baku latency_ms
+	formatFail           float64 // proporsi output gagal format (tidak masuk cache)
+}
+
+// stubProfiles: kalibrasi dari pilot AI 5 Nov 2026 di server (90 panggilan Hermes sungguhan, no_cache,
+// berurutan; model default Hermes, toolset context_engine, prompt hermes-v5; BTC, ETH, XAU, BBCA, TLKM,
+// ANTM x 3 metode x 5). Supaya selisih latency HIT vs MISS, biaya relatif antar metode, dan proporsi
+// output yang tidak boleh di-cache di lab stub mendekati kenyataan.
+var stubProfiles = map[string]stubProfile{
+	"debate":   {2849, 1019, 17440, 5350, 2.0 / 30},
+	"mtf":      {4426, 465, 12151, 4644, 0},
+	"grounded": {2838, 1551, 21695, 5228, 0},
+}
+
+// stubLatency menarik latency dari distribusi lognormal dengan mean dan sd profil (latency AI selalu
+// positif dan menceng kanan: sesekali jauh lebih lama dari rata-rata), dibatasi 1 dtk sampai 4 x mean.
+func stubLatency(p stubProfile, rng *rand.Rand) time.Duration {
+	sigma2 := math.Log(1 + (p.latencySD*p.latencySD)/(p.latencyMS*p.latencyMS))
+	mu := math.Log(p.latencyMS) - sigma2/2
+	ms := math.Exp(mu + math.Sqrt(sigma2)*rng.NormFloat64())
+	return time.Duration(min(max(ms, 1000), 4*p.latencyMS)) * time.Millisecond
 }
 
 // AIResult adalah hasil satu panggilan AI inference (respons /analyze AI service).
@@ -74,22 +94,41 @@ func NewAIClient(mode, url string) AIClient {
 		}
 		return &httpAI{url: url, client: &http.Client{Timeout: time.Duration(sec) * time.Second}}
 	}
-	delay := 300
-	if v, err := strconv.Atoi(env("STUB_DELAY_MS", "300")); err == nil && v >= 0 {
-		delay = v
+	// STUB_DELAY_MS = pilot (default): latency, token, dan gagal format per metode mengikuti stubProfiles.
+	// Angka (mis. 300): delay tetap tanpa gagal format, untuk uji UI / pipeline yang cepat.
+	s := &stubAI{rng: rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0x5741))}
+	if v, err := strconv.Atoi(env("STUB_DELAY_MS", "pilot")); err == nil && v >= 0 {
+		d := time.Duration(v) * time.Millisecond
+		s.fixed = &d
 	}
-	return &stubAI{delay: time.Duration(delay) * time.Millisecond}
+	return s
 }
 
 // ---- stub ----
 
-type stubAI struct{ delay time.Duration }
+type stubAI struct {
+	fixed *time.Duration // nil = profil pilot
+	mu    sync.Mutex     // rand.Rand tidak aman dipakai bersamaan
+	rng   *rand.Rand
+}
+
+// draw: delay dan apakah output kali ini gagal format.
+func (s *stubAI) draw(p stubProfile) (time.Duration, bool) {
+	if s.fixed != nil {
+		return *s.fixed, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return stubLatency(p, s.rng), s.rng.Float64() < p.formatFail
+}
 
 var biasOfSignal = map[string]string{"BUY": "bullish", "SELL": "bearish", "HOLD": "neutral"}
 
 func (s *stubAI) Analyze(ctx context.Context, in AIInput) (*AIResult, error) {
+	prof := stubProfiles[in.Method]
+	delay, failed := s.draw(prof)
 	select {
-	case <-time.After(s.delay):
+	case <-time.After(delay):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -107,18 +146,21 @@ func (s *stubAI) Analyze(ctx context.Context, in AIInput) (*AIResult, error) {
 	for _, c := range candles {
 		lo, hi = min(lo, c.Low), max(hi, c.High)
 	}
-	tok := stubTokens[in.Method]
-	cost := float64(tok[0])*stubPriceInPerM/1e6 + float64(tok[1])*stubPriceOutPerM/1e6
-	ok, execMS, queueMS, tools, conf := true, int(s.delay.Milliseconds()), 0, 0, 50
+	cost := float64(prof.tokensIn)*stubPriceInPerM/1e6 + float64(prof.tokensOut)*stubPriceOutPerM/1e6
+	ok, execMS, queueMS, tools, conf := !failed, int(delay.Milliseconds()), 0, 0, 50
+	detail := stubDetail(in.Method, biasOfSignal[signal])
+	if failed { // seperti AI service: teks mentah disimpan, detail kosong, tidak masuk cache
+		detail = nil
+	}
 	return &AIResult{
 		Content:       fmt.Sprintf("Ringkasan stub %s untuk %s dari %d candle.", in.Method, in.Symbol, len(candles)),
 		Signal:        signal,
 		Method:        in.Method,
 		Confidence:    &conf,
-		Detail:        stubDetail(in.Method, biasOfSignal[signal]),
+		Detail:        detail,
 		Model:         "stub",
-		TokensIn:      tok[0],
-		TokensOut:     tok[1],
+		TokensIn:      prof.tokensIn,
+		TokensOut:     prof.tokensOut,
 		CostUSD:       cost,
 		PromptVersion: "stub",
 		Support:       &lo,

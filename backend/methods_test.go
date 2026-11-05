@@ -239,3 +239,39 @@ func TestStubDetailShape(t *testing.T) {
 		}
 	}
 }
+
+func TestStubPilotProfile(t *testing.T) {
+	s := NewAIClient("stub", "").(*stubAI) // STUB_DELAY_MS tidak di-set di tes = profil pilot
+	if s.fixed != nil {
+		t.Skip("STUB_DELAY_MS di-set di environment")
+	}
+	for method, p := range stubProfiles {
+		const n = 20000
+		var sum float64
+		fails := 0
+		for range n {
+			d, failed := s.draw(p)
+			if d < time.Second || d > time.Duration(4*p.latencyMS)*time.Millisecond {
+				t.Fatalf("%s: delay %v di luar batas", method, d)
+			}
+			sum += float64(d.Milliseconds())
+			if failed {
+				fails++
+			}
+		}
+		if mean := sum / n; math.Abs(mean-p.latencyMS)/p.latencyMS > 0.05 {
+			t.Errorf("%s: mean delay %.0f ms, profil %.0f ms", method, mean, p.latencyMS)
+		}
+		if rate := float64(fails) / n; math.Abs(rate-p.formatFail) > 0.01 {
+			t.Errorf("%s: gagal format %.3f, profil %.3f", method, rate, p.formatFail)
+		}
+	}
+}
+
+func TestStubFixedDelay(t *testing.T) {
+	t.Setenv("STUB_DELAY_MS", "0")
+	s := NewAIClient("stub", "").(*stubAI)
+	if d, failed := s.draw(stubProfiles["debate"]); d != 0 || failed {
+		t.Fatalf("delay tetap: dapat %v failed=%v", d, failed)
+	}
+}
