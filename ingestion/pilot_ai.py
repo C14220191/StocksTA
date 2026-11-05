@@ -30,7 +30,9 @@ def summary(values):
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")  # konsol Windows (cp1252) tidak bisa mencetak σ / c̄
+    # konsol Windows (cp1252) tidak bisa mencetak σ / c̄; line_buffering supaya progres langsung terlihat
+    # walau output diarahkan ke file (nohup ... > logs/pilot_ai.out)
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=10, help="jumlah panggilan per instrument")
     ap.add_argument("--symbols", help="daftar simbol dipisah koma (default: semua instrument)")
