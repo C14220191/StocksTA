@@ -125,6 +125,22 @@ class ParseOutput(unittest.TestCase):
         self.assertEqual(d["debate"][0]["round"], 1)
         self.assertEqual(d["risk"]["worst_case"], "turun tajam")
 
+    def test_debate_split_rounds_merged(self):
+        # pola nyata pilot 5 Nov (log 107): satu ronde dipecah menjadi elemen bull dan elemen bear
+        raw = json.dumps({"debate": [{"round": 1, "bull": "b1"}, {"round": 1, "bear": "s1"},
+                                     {"round": 2, "bull": "b2", "bear": "s2"}, {"round": 2, "bear": "ganda"}],
+                          "bias": "neutral", "summary": "s"})
+        d = app.parse_output(raw, 105, "debate")["detail"]
+        self.assertEqual(d["debate"], [{"round": 1, "bull": "b1", "bear": "s1"},
+                                       {"round": 2, "bull": "b2", "bear": "s2"}])
+
+    def test_no_conclusion_stays_invalid(self):
+        # log 13: analysts tidak ditutup, lalu output berhenti setelah debate tanpa risk/bias/summary.
+        # Parser hanya memperbaiki sintaks, tidak mengarang kesimpulan.
+        raw = ('{"analysts":[{"role":"technical","signal":"bullish","confidence":58,"reason":"r"},'
+               '"debate":[{"round":1,"bull":"a","bear":"b"}]}')
+        self.assertFalse(app.parse_output(raw, 105, "debate")["format_ok"])
+
     def test_advice_terms_flagged(self):
         raw = json.dumps({"bias": "bullish", "summary": "Entry di 100 dengan stop loss 95."})
         d = app.parse_output(raw, 105, "grounded")["detail"]

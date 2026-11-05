@@ -425,10 +425,15 @@ def normalize_debate(d: dict) -> dict:
         a = by_role.get(role) or {}
         analysts.append({"role": role, "signal": _bias(a.get("signal")) or "neutral",
                          "confidence": _conf(a.get("confidence")), "reason": _text(a.get("reason"), 300)})
-    rounds = []
+    # Model kecil kadang memecah satu ronde: {"round":1,"bull":..},{"round":1,"bear":..}. Elemen dengan nomor
+    # ronde sama digabung; isi pertama yang tidak kosong untuk tiap sisi yang dipakai (pilot 5 Nov, log 13/107).
+    by_round: dict[int, dict] = {}
     for i, r in enumerate(x for x in d.get("debate") or [] if isinstance(x, dict)):
-        rounds.append({"round": _conf(r.get("round")) or i + 1,
-                       "bull": _text(r.get("bull"), 400), "bear": _text(r.get("bear"), 400)})
+        n = _conf(r.get("round")) or i + 1
+        cur = by_round.setdefault(n, {"round": n, "bull": "", "bear": ""})
+        for side in ("bull", "bear"):
+            cur[side] = cur[side] or _text(r.get(side), 400)
+    rounds = [by_round[n] for n in sorted(by_round)]
     risk = d.get("risk")
     if not isinstance(risk, dict):
         risk = {"worst_case": risk}
