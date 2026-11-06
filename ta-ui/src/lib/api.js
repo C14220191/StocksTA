@@ -1,6 +1,9 @@
 // Client untuk backend Go. Endpoint mengikuti dokumentasi "API untuk UI".
 // URL backend dari .env (VITE_API_URL), lihat .env.example.
+import { clearAdminSession, getAdminToken } from "./adminAuth.js";
+
 const BASE = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
+const LOGIN_PATH = "/api/admin/login";
 
 export class ApiError extends Error {
   constructor(status, message) {
@@ -15,15 +18,24 @@ const STATUS_MESSAGE = {
   422: "Data harga untuk instrumen ini belum tersedia.",
 };
 
-async function request(method, path, params = {}, signal) {
+// body (opsional) dikirim sebagai JSON. Endpoint admin selain login membawa token sesi; 401 dari
+// endpoint admin = sesi habis atau tidak sah, jadi sesi dihapus dan AdminLayout kembali ke login.
+async function request(method, path, params = {}, signal, body) {
   const url = new URL(BASE + path);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
   }
+  const admin = path.startsWith("/api/admin/") && path !== LOGIN_PATH;
+  const headers = {};
+  if (admin) {
+    const token = getAdminToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
+  if (body !== undefined) headers["Content-Type"] = "application/json";
 
   let res;
   try {
-    res = await fetch(url, { method, signal });
+    res = await fetch(url, { method, signal, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   } catch (e) {
     if (e.name === "AbortError") throw e;
     throw new ApiError(
@@ -39,7 +51,9 @@ async function request(method, path, params = {}, signal) {
     } catch {
       /* body bukan JSON */
     }
-    throw new ApiError(res.status, detail || STATUS_MESSAGE[res.status] || `Permintaan gagal (HTTP ${res.status}).`);
+    if (admin && res.status === 401) clearAdminSession("expired");
+    const fallback = admin ? undefined : STATUS_MESSAGE[res.status]; // pesan 404/422 khusus halaman pengguna
+    throw new ApiError(res.status, detail || fallback || `Permintaan gagal (HTTP ${res.status}).`);
   }
   return res.json();
 }
@@ -86,3 +100,15 @@ export const getAdminHealth = (signal) => get("/api/admin/health", {}, signal);
 // method kosong = semua metode instrument tersebut
 export const invalidateCache = (symbol, method) =>
   request("POST", `/api/admin/cache/${sym(symbol)}/invalidate`, { method });
+
+// Login admin -> { token, expires_at }; simpan dengan saveAdminSession (lib/adminAuth.js).
+export const adminLogin = (password) => request("POST", LOGIN_PATH, {}, undefined, { password });
+export const getAdminSession = (signal) => get("/api/admin/session", {}, signal);
+
+// Instrumen. asset_type: stock | crypto | commodity
+export const getAdminInstruments = (signal) => get("/api/admin/instruments", {}, signal);
+export const lookupInstrument = (asset_type, symbol, signal) =>
+  get("/api/admin/instruments/lookup", { asset_type, symbol }, signal);
+export const addInstrument = ({ asset_type, symbol, name }) =>
+  request("POST", "/api/admin/instruments", {}, undefined, { asset_type, symbol, name });
+export const reingestInstrument = (symbol) => request("POST", `/api/admin/instruments/${sym(symbol)}/ingest`);

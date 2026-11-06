@@ -60,6 +60,11 @@ func main() {
 		cfg:    cfg,
 		ai:     ai,
 		rdb:    newAdminRedis(),
+		auth:   newAdminAuth(),
+		ingest: newIngestRunner(store),
+	}
+	if !app.auth.enabled() {
+		slog.Warn("ADMIN_PASSWORD kosong: halaman dan endpoint admin ditutup (isi di .env)")
 	}
 
 	// Watcher: event-driven invalidation proaktif untuk kondisi yang memakai θ (event_only, hybrid).
@@ -97,10 +102,14 @@ func main() {
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover())
-	// CORS untuk dev server React (Vite :5173 / CRA :3000). Hanya GET yang dipakai UI.
+	// CORS untuk dev server React (Vite :5173 / CRA :3000). POST hanya untuk aksi admin; header
+	// Authorization (token admin) dan Content-Type (body JSON) membuat browser mengirim preflight,
+	// yang di-cache MaxAge detik supaya halaman admin yang polling tidak menggandakan request.
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins: strings.Split(env("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"), ","),
-		AllowMethods: []string{http.MethodGet, http.MethodPost}, // POST hanya untuk aksi admin
+		AllowMethods: []string{http.MethodGet, http.MethodPost},
+		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-TA-Trigger"},
+		MaxAge:       600,
 	}))
 	// Rate limiting per IP (Bab 3.3.1). k6 dan pilot dikecualikan supaya beban uji tidak terpotong;
 	// RATE_LIMIT_RPS=0 mematikannya.
@@ -129,13 +138,21 @@ func main() {
 	e.GET("/api/instruments/:symbol", app.InstrumentDetail)
 	e.GET("/api/instruments/:symbol/candles", app.InstrumentCandles)
 
-	// Admin (UI /admin). Tanpa autentikasi: backend hanya listen di LISTEN_HOST (127.0.0.1).
-	e.GET("/api/admin/overview", app.AdminOverview)
-	e.GET("/api/admin/cache", app.AdminCache)
-	e.POST("/api/admin/cache/:symbol/invalidate", app.AdminInvalidate)
-	e.GET("/api/admin/prompt", app.AdminPrompt)
-	e.GET("/api/admin/evaluation", app.AdminEvaluation)
-	e.GET("/api/admin/health", app.AdminHealth)
+	// Admin (UI /admin). Login dengan ADMIN_PASSWORD (.env) -> token; semua endpoint lain di bawah
+	// /api/admin wajib "Authorization: Bearer <token>" (auth.go).
+	e.POST("/api/admin/login", app.AdminLogin)
+	adm := e.Group("/api/admin", app.requireAdmin)
+	adm.GET("/session", app.AdminSession)
+	adm.GET("/overview", app.AdminOverview)
+	adm.GET("/cache", app.AdminCache)
+	adm.POST("/cache/:symbol/invalidate", app.AdminInvalidate)
+	adm.GET("/prompt", app.AdminPrompt)
+	adm.GET("/evaluation", app.AdminEvaluation)
+	adm.GET("/health", app.AdminHealth)
+	adm.GET("/instruments", app.AdminInstruments)
+	adm.GET("/instruments/lookup", app.AdminInstrumentLookup)
+	adm.POST("/instruments", app.AdminAddInstrument)
+	adm.POST("/instruments/:symbol/ingest", app.AdminIngestInstrument)
 
 	port := env("PORT", "8080")
 	slog.Info("server jalan", "port", port, "instance", cfg.instanceKey(), "cache_mode", policy.Name(),

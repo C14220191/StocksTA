@@ -133,6 +133,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--timeframe", choices=["1h", "1d"], required=True)
     ap.add_argument("--backfill", action="store_true", help="isi ulang sekitar 1 tahun")
+    ap.add_argument("--symbols", help="daftar simbol dipisah koma (default: semua instrument). "
+                                      "Dipakai backend saat instrumen ditambahkan lewat halaman admin")
     args = ap.parse_args()
 
     if not DATABASE_URL:
@@ -144,6 +146,9 @@ def main():
         cur.execute("SELECT instrument_id, max(ts) FROM ohlcv WHERE timeframe = %s GROUP BY 1",
                     (args.timeframe,))
         last_ts = dict(cur.fetchall())
+    if args.symbols:
+        wanted = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
+        instruments = [row for row in instruments if row[0] in wanted]
     upsert = UPSERT_SQL.format(interval=INTERVAL_SQL[args.timeframe])
 
     fetchers = {

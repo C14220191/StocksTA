@@ -138,7 +138,7 @@ func NewPolicy(ctx context.Context, cfg policyConfig, store *Store) (CachePolicy
 		if err != nil {
 			return nil, err
 		}
-		p.ttl = dt.TTL
+		p.ttl, p.dyn = dt.TTL, dt
 	case "event_only":
 		// Tanpa kedaluwarsa berbasis waktu; batas atas hanya pengaman supaya Redis tidak menumpuk entry.
 		sec, err := envSeconds("EVENT_MAX_TTL_SECONDS", 86400)
@@ -211,7 +211,8 @@ type RedisPolicy struct {
 	version    string // prompt_version, bagian dari key supaya summary prompt lama tidak terpakai
 	rdb        *redis.Client
 	ttl        func(symbol string, volatility float64) time.Duration
-	threshold  float64 // persen; 0 = tanpa event invalidation
+	dyn        *DynamicTTL // nil kalau kondisi tidak memakai TTL dinamis (admin: status σ_ref)
+	threshold  float64     // persen; 0 = tanpa event invalidation
 	checkState bool
 	watcher    *Watcher // nil kalau kondisi tanpa event invalidation
 }

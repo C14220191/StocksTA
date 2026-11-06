@@ -32,6 +32,8 @@ type App struct {
 	rdb    *redis.Client // popularitas + API Health admin (ada juga saat no_cache); nil kalau Redis mati
 	pregen *PregenConfig // nil kalau PREGEN=off
 	flight singleflight.Group
+	auth   *adminAuth    // login halaman admin
+	ingest *ingestRunner // backfill instrumen yang ditambahkan lewat admin
 }
 
 type AnalyzeResponse struct {
@@ -46,22 +48,22 @@ type AnalyzeResponse struct {
 	Detail            json.RawMessage `json:"detail"` // isi terstruktur metode; null kalau output AI bukan JSON
 	Model             string          `json:"model"`
 	FormatOK          *bool           `json:"format_ok,omitempty"` // hanya saat AI dipanggil request ini
-	LatencyMS         int64     `json:"latency_ms"`
-	TokensIn          int       `json:"tokens_in"`
-	TokensOut         int       `json:"tokens_out"`
-	CacheReadTokens   int       `json:"cache_read_tokens"`
-	CostUSD           float64   `json:"cost_usd"`
-	DataAgeSeconds    int       `json:"data_age_seconds"`
-	CacheAgeSeconds   int       `json:"cache_age_seconds"`
-	SourceDataTS      time.Time `json:"source_data_ts"`
-	GeneratedAt       time.Time `json:"generated_at"`
-	PriceAtGeneration float64   `json:"price_at_generation"`
-	PriceAtRequest    float64   `json:"price_at_request"`
-	PriceDeviationPct *float64  `json:"price_deviation_pct"`
-	StateAtGeneration string    `json:"state_at_generation"`
-	StateAtRequest    string    `json:"state_at_request"`
-	Support           *float64  `json:"support"`    // dari AI
-	Resistance        *float64  `json:"resistance"` // dari AI
+	LatencyMS         int64           `json:"latency_ms"`
+	TokensIn          int             `json:"tokens_in"`
+	TokensOut         int             `json:"tokens_out"`
+	CacheReadTokens   int             `json:"cache_read_tokens"`
+	CostUSD           float64         `json:"cost_usd"`
+	DataAgeSeconds    int             `json:"data_age_seconds"`
+	CacheAgeSeconds   int             `json:"cache_age_seconds"`
+	SourceDataTS      time.Time       `json:"source_data_ts"`
+	GeneratedAt       time.Time       `json:"generated_at"`
+	PriceAtGeneration float64         `json:"price_at_generation"`
+	PriceAtRequest    float64         `json:"price_at_request"`
+	PriceDeviationPct *float64        `json:"price_deviation_pct"`
+	StateAtGeneration string          `json:"state_at_generation"`
+	StateAtRequest    string          `json:"state_at_request"`
+	Support           *float64        `json:"support"`    // dari AI
+	Resistance        *float64        `json:"resistance"` // dari AI
 }
 
 // genOut: hasil satu kali pembuatan summary, dibagikan ke request yang menunggu (singleflight).

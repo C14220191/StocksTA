@@ -100,6 +100,27 @@ def cost_of(row, args):
             + (row["cache_read_tokens"] or 0) * p_cache) / 1e6
 
 
+def regression(rows):
+    """latency = a + b x T_out (OLS) atas semua panggilan berhasil: a = biaya tetap per proses Hermes
+    (start CLI, memuat skill, waktu sampai token pertama), b = waktu per token output."""
+    if len(rows) < 3:
+        return
+    x = [r["tokens_out"] for r in rows]
+    y = [r["latency_ms"] / 1000 for r in rows]
+    n, mx, my = len(x), statistics.fmean(x), statistics.fmean(y)
+    sxx = sum((v - mx) ** 2 for v in x)
+    if sxx == 0:
+        return
+    b = sum((u - mx) * (v - my) for u, v in zip(x, y)) / sxx
+    a = my - b * mx
+    sse = sum((v - a - b * u) ** 2 for u, v in zip(x, y))
+    r2 = 1 - sse / sum((v - my) ** 2 for v in y)
+    se_b = (sse / (n - 2) / sxx) ** 0.5
+    print(f"\nRegresi latency terhadap T_out (n={n}): latency = {a:.2f} dtk + {b * 1000:.2f} ms x T_out "
+          f"(95% CI {(b - 1.96 * se_b) * 1000:.2f}-{(b + 1.96 * se_b) * 1000:.2f} ms), R2 = {r2:.3f}, "
+          f"~{1 / b:.0f} token output/dtk" if b > 0 else f"\nRegresi latency terhadap T_out: kemiringan {b:.4f}")
+
+
 def report(rows, args):
     if args.price_in is not None or args.price_out is not None:
         p_cache = args.price_in if args.price_cache is None else args.price_cache
@@ -126,6 +147,7 @@ def report(rows, args):
         cbar = statistics.fmean(cost_of(r, args) for r in g)
         print(f"  cost/analisis c̄ = ${cbar:.6f}  ->  C_nc = N x c̄ : "
               + ", ".join(f"N={n:,}: ${n * cbar:,.4f}" for n in (100, 1_000, 10_000)))
+    regression([r for r in rows if r["ok"] and r["latency_ms"] and r["tokens_out"]])
     fails = [r for r in rows if not r["ok"]]
     if fails:
         print(f"\n{len(fails)} panggilan gagal (pesan lengkap ada di inference_log.error):")

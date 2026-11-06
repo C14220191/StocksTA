@@ -99,6 +99,16 @@ func NewPriceFeed(spot, futures []string) *PriceFeed {
 	return f
 }
 
+// Tracks: simbol ini ikut stream WebSocket. Daftar simbol dibaca saat backend start, jadi instrumen
+// yang ditambahkan lewat admin baru ikut setelah restart. bySymbol tidak diubah setelah dibuat.
+func (f *PriceFeed) Tracks(symbol string) bool {
+	if f == nil {
+		return false
+	}
+	_, ok := f.bySymbol[symbol]
+	return ok
+}
+
 // tickerURL: endpoint ticker/price di host yang sama dengan URL klines (ingestion).
 func tickerURL(klines string) string {
 	return strings.TrimSuffix(strings.TrimRight(klines, "/"), "klines") + "ticker/price"

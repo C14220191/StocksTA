@@ -8,10 +8,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var ErrNotFound = errors.New("tidak ditemukan")
+var (
+	ErrNotFound = errors.New("tidak ditemukan")
+	ErrExists   = errors.New("sudah ada")
+)
 
 type Candle struct {
 	TS     time.Time
@@ -86,6 +90,83 @@ func (s *Store) InstrumentID(ctx context.Context, symbol string) (int, error) {
 		return 0, ErrNotFound
 	}
 	return id, err
+}
+
+func (s *Store) InstrumentAssetType(ctx context.Context, symbol string) (string, error) {
+	var t string
+	err := s.pool.QueryRow(ctx, `SELECT asset_type FROM instruments WHERE symbol = $1`, symbol).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return t, err
+}
+
+// AddInstrument: ErrExists kalau simbol sudah terdaftar.
+func (s *Store) AddInstrument(ctx context.Context, symbol, name, assetType, source string) (int, error) {
+	var id int
+	err := s.pool.QueryRow(ctx, `INSERT INTO instruments (symbol, name, asset_type, source)
+		VALUES ($1, $2, $3, $4) RETURNING id`, symbol, name, assetType, source).Scan(&id)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+		return 0, ErrExists
+	}
+	return id, err
+}
+
+// LogJob: satu baris job_runs (format sama dengan log_job di ingestion Python).
+func (s *Store) LogJob(ctx context.Context, job, target string, started time.Time, status, message string) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO job_runs (job, target, started_at, status, rows, message)
+		VALUES ($1, $2, $3, $4, 0, NULLIF($5, ''))`, job, target, started, status, message)
+	return err
+}
+
+// AdminInstruments: semua instrumen + jumlah dan candle terakhir per timeframe + eksekusi job terakhir.
+func (s *Store) AdminInstruments(ctx context.Context) ([]*adminInstrument, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH c AS (
+			SELECT instrument_id,
+			       count(*) FILTER (WHERE timeframe = '1h') AS n1h, max(ts) FILTER (WHERE timeframe = '1h') AS l1h,
+			       count(*) FILTER (WHERE timeframe = '1d') AS n1d, max(ts) FILTER (WHERE timeframe = '1d') AS l1d
+			FROM ohlcv GROUP BY instrument_id)
+		SELECT i.id, i.symbol, coalesce(i.name, ''), i.asset_type, i.source,
+		       coalesce(c.n1h, 0), c.l1h, coalesce(c.n1d, 0), c.l1d
+		FROM instruments i LEFT JOIN c ON c.instrument_id = i.id
+		ORDER BY i.asset_type, i.symbol`)
+	if err != nil {
+		return nil, err
+	}
+	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (*adminInstrument, error) {
+		x := &adminInstrument{Jobs: map[string]*instrumentJob{}}
+		err := r.Scan(&x.ID, &x.Symbol, &x.Name, &x.AssetType, &x.Source, &x.Candles1h, &x.Last1h, &x.Candles1d, &x.Last1d)
+		return x, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	bySymbol := make(map[string]*adminInstrument, len(list))
+	for _, x := range list {
+		bySymbol[x.Symbol] = x
+	}
+	jobs, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (target, job) target, job, status, finished_at, rows, message
+		FROM job_runs
+		WHERE job IN ('ingest_1h', 'ingest_1d', 'fundamentals') AND target IS NOT NULL
+		ORDER BY target, job, finished_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer jobs.Close()
+	for jobs.Next() {
+		var target, job string
+		var j instrumentJob
+		if err := jobs.Scan(&target, &job, &j.Status, &j.At, &j.Rows, &j.Message); err != nil {
+			return nil, err
+		}
+		if x := bySymbol[target]; x != nil {
+			x.Jobs[job] = &j
+		}
+	}
+	return list, jobs.Err()
 }
 
 func (s *Store) SymbolsBySource(ctx context.Context, source string) ([]string, error) {

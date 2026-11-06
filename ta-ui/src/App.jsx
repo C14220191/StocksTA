@@ -9,6 +9,8 @@ import PromptPage from "./admin/pages/PromptPage.jsx";
 import CachePage from "./admin/pages/CachePage.jsx";
 import EvaluationPage from "./admin/pages/EvaluationPage.jsx";
 import HealthPage from "./admin/pages/HealthPage.jsx";
+import InstrumentsPage from "./admin/pages/InstrumentsPage.jsx";
+import LoginPage from "./admin/LoginPage.jsx";
 
 // key={symbol} membuat state Detail Page di-reset penuh saat pindah instrumen
 function DetailRoute() {
@@ -30,11 +32,13 @@ function UserLayout() {
 export default function App() {
   return (
     <Routes>
-      {/* Admin: tanpa autentikasi, backend hanya bisa diakses dari 127.0.0.1 */}
+      {/* Admin: wajib login (ADMIN_PASSWORD di .env backend); AdminLayout mengalihkan ke /admin/login */}
+      <Route path="/admin/login" element={<LoginPage />} />
       <Route path="/admin" element={<AdminLayout />}>
         <Route index element={<DashboardPage />} />
         <Route path="prompt" element={<PromptPage />} />
         <Route path="cache" element={<CachePage />} />
+        <Route path="instruments" element={<InstrumentsPage />} />
         <Route path="evaluation" element={<EvaluationPage />} />
         <Route path="health" element={<HealthPage />} />
       </Route>

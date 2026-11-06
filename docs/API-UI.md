@@ -171,7 +171,20 @@ Origin yang diizinkan diatur `CORS_ORIGINS` di `run.env` (default `http://localh
 
 ## Admin (`/admin` di UI)
 
-Tanpa autentikasi: backend hanya listen di `127.0.0.1`, akses dari mesin yang sama atau lewat SSH tunnel.
+**Autentikasi.** Semua `/api/admin/*` selain login wajib header `Authorization: Bearer <token>`
+(tanpa token / token tidak sah atau kedaluwarsa: `401`). Kata sandi admin = `ADMIN_PASSWORD` di `.env`
+(rahasia, tidak di-commit); kalau kosong, admin ditutup (`503`). Token ditandatangani HMAC-SHA256
+dengan kunci turunan kata sandi, berlaku `ADMIN_SESSION_HOURS` (default 12) dan tetap sah setelah
+backend restart; mengganti kata sandi membatalkan semua token. Login gagal dibatasi 10 kali per 10 menit
+(global, `429`). UI menyimpan token di `localStorage` dan kembali ke `/admin/login` saat menerima `401`.
+
+| Endpoint | Isi |
+|---|---|
+| `POST /api/admin/login` `{"password"}` | `{"token", "expires_at"}` atau `401 Kata sandi salah.` |
+| `GET /api/admin/session` | `{"expires_at"}`: cek token tersimpan masih berlaku |
+
+Backend tetap listen di `127.0.0.1`; dari luar server pakai SSH tunnel (`npm run dev:server`, lihat
+`ta-ui/.env.server`). Kalau suatu saat dibuka ke jaringan, wajib lewat HTTPS (token dikirim di header).
 
 | Halaman | Endpoint | Isi |
 |---|---|---|
@@ -181,5 +194,18 @@ Tanpa autentikasi: backend hanya listen di `127.0.0.1`, akses dari mesin yang sa
 | Cache & Job | `POST /api/admin/cache/:symbol/invalidate?method=` | Buang cache satu instrumen (satu metode, atau semua kalau `method` kosong), dicatat di `cache_events` dengan reason `manual` |
 | Evaluasi | `GET /api/admin/evaluation?days=30&trigger=all\|k6\|ui\|pilot\|manual&prompt=current\|stub\|all&method=all\|debate\|mtf\|grounded` | Metrik Bab 2.7 per kondisi × θ × pregen: H, latency p50/p95/p99, N_gen, N_pre, S, W, D_serve, SSR (θ_s 1/2/5/10), SFR, L_inv + akurasi backtest. `quota` (AI berlangganan): kuota terpakai per jendela dari `quota_snapshots`, per kondisi `quota_pct`, `requests_per_quota` (kapasitas per 100%), `subscription_cost` (amortisasi) |
 | API Health | `GET /api/admin/health` | PostgreSQL, Redis, AI service, price feed spot/futures, ingestion per sumber, log kesalahan 7 hari |
+| Instrumen | `GET /api/admin/instruments` | Semua instrumen: jumlah + candle terakhir 1h/1d, eksekusi terakhir `ingest_1h`/`ingest_1d`/`fundamentals`, `ingesting`, `live_price` / `sigma_ref` (`false` = perlu restart backend; `null` = tidak relevan), `counts` per jenis |
+| Instrumen | `GET /api/admin/instruments/lookup?asset_type=stock\|crypto\|commodity&symbol=` | Pratinjau tanpa menyimpan: simbol dinormalisasi (`bbca` → `BBCA.JK`, `sol` / `SOL/USDT` → `SOLUSDT`) lalu dicek ke sumber. `400` format salah, `404` tidak terdaftar / jenis salah, `502` sumber tidak bisa dihubungi |
+| Instrumen | `POST /api/admin/instruments` `{"asset_type", "symbol", "name"?}` | Cek ulang ke sumber, simpan, mulai backfill di background. `201 {"instrument", "ingest_started", "notes"}`, `409` sudah terdaftar |
+| Instrumen | `POST /api/admin/instruments/:symbol/ingest` | Jalankan ulang backfill (`202`; `409` kalau sedang berjalan) |
+
+Aturan sumber saat menambah instrumen: saham = Yahoo Finance, wajib Bursa Efek Indonesia (`exchangeName`
+JKT, IDR); kripto = Binance spot, pasangan USDT berstatus TRADING; komoditas = Binance USDⓈ-M futures
+dengan `underlyingType` COMMODITY (TradFi perpetual, `contractType` TRADIFI_PERPETUAL; per 6 Nov 2026
+kedelapannya sudah terdaftar). Backfill memakai skrip yang sama dengan cron:
+`ingest.py --timeframe 1h|1d --symbols S` (+ `fundamentals.py --symbols S` untuk saham), dijalankan
+backend dari `TA_ROOT` (default `..`) dengan Python `INGEST_PYTHON` atau `.venv` di `TA_ROOT`. Daftar
+price feed WebSocket dan σ_ref TTL dinamis dibaca saat start, jadi keduanya aktif setelah restart;
+sebelum itu instrumen baru memakai harga candle 1h dan TTL_min.
 
 `job_runs` (migrasi 006) diisi oleh `ingest.py` dan `backtest.py`, satu baris per job per instrumen.
