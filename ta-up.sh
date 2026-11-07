@@ -24,6 +24,7 @@
 #
 # Benchmark (eksperimen utama Bab 4): lab stub + k6 di background, aman ditinggal / SSH putus.
 #   ./ta-up.sh bench start [DURASI] [RATE]    # default 7d (1 minggu), 6 kunjungan/menit; uji singkat: 30m
+#   ./ta-up.sh bench plan                     # pratinjau distribusi popularitas (Zipf) tanpa memulai apa pun
 #   ./ta-up.sh bench status [ID]              # progres, request per kondisi, link Evaluasi untuk jendela run
 #   ./ta-up.sh bench stop                     # hentikan lebih awal (jendela run tetap tercatat)
 #   ./ta-up.sh bench list
@@ -233,6 +234,72 @@ bench_running() {
     kill -0 "$(cat "$dir/wrapper.pid" 2>/dev/null)" 2>/dev/null
 }
 
+# Popularitas (MIX k6): Zipf atas semua instrumen yang punya data, dibekukan di awal run.
+# Peringkat dalam tiap kelas aset = rata-rata nilai transaksi harian 30 hari; antar kelas disusun
+# bergiliran (kripto, saham, komoditas). Nilai transaksi tidak dibandingkan lintas kelas karena
+# volume futures (komoditas) adalah nilai nosional ber-leverage: diurutkan langsung, komoditas
+# memenuhi peringkat atas. BENCH_MIX="SIMBOL:bobot,..." untuk distribusi lain.
+# Menulis <dir>/turnover.txt dan <dir>/popularity.csv. Angka selalu memakai titik desimal
+# (LC_ALL=C): dengan locale id_ID awk menulis "0,500000" sehingga kolom CSV dan bobot k6 rusak.
+bench_popularity() {
+    local dir="$1" usdidr="${USDIDR_RATE:-16000}" zipf_s="${BENCH_ZIPF_S:-1}"
+    [[ "$usdidr" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "USDIDR_RATE tidak valid: $usdidr"
+    [[ "$zipf_s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "BENCH_ZIPF_S tidak valid: $zipf_s"
+    psql_q -v rate="$usdidr" > "$dir/turnover.txt" << 'SQL' || die "Gagal menghitung peringkat popularitas"
+WITH t AS (
+    SELECT i.symbol, i.asset_type,
+           round(avg(o.close * o.volume / CASE WHEN i.source = 'yahoo' THEN :rate ELSE 1 END))::bigint AS usd
+    FROM instruments i
+    JOIN ohlcv o ON o.instrument_id = i.id AND o.timeframe = '1d' AND o.ts >= now() - interval '30 days'
+    WHERE EXISTS (SELECT 1 FROM ohlcv h WHERE h.instrument_id = i.id AND h.timeframe = '1h'
+                  AND h.ts >= now() - interval '7 days')
+    GROUP BY i.symbol, i.asset_type)
+SELECT symbol, asset_type, r, usd
+FROM (SELECT t.*, row_number() OVER (PARTITION BY asset_type ORDER BY usd DESC NULLS LAST, symbol) AS r FROM t) x
+ORDER BY r, array_position(ARRAY['crypto', 'stock', 'commodity'], asset_type), symbol;
+SQL
+    if (( $(wc -l < "$dir/turnover.txt") < 3 )); then
+        die "Instrumen dengan data terlalu sedikit untuk benchmark ($dir/turnover.txt)"
+    fi
+    LC_ALL=C awk -F'|' -v s="$zipf_s" '
+        { sym[NR] = $1; cls[NR] = $2; r[NR] = $3; t[NR] = $4; w[NR] = 1 / (NR ^ s); tot += w[NR] }
+        END {
+            print "rank,symbol,asset_type,rank_in_class,turnover_usd_30d,weight,share_pct"
+            for (i = 1; i <= NR; i++)
+                printf "%d,%s,%s,%d,%s,%.6f,%.3f\n", i, sym[i], cls[i], r[i], t[i], w[i], w[i] / tot * 100
+        }' "$dir/turnover.txt" > "$dir/popularity.csv"
+    # Pengaman: 7 kolom per baris dan total pangsa 100%
+    LC_ALL=C awk -F, 'NR > 1 { if (NF != 7) bad = 1; s += $7 } END { exit (bad || s < 99.9 || s > 100.1) }' \
+        "$dir/popularity.csv" || die "popularity.csv tidak valid (cek locale/angka): $dir/popularity.csv"
+}
+
+# MIX k6 dari popularity.csv: "BTCUSDT:1.000000,BBCA.JK:0.500000,..."
+bench_mix() {
+    local mix
+    mix=$(LC_ALL=C awk -F, 'NR > 1 { printf "%s%s:%s", (NR > 2 ? "," : ""), $2, $6 }' "$1")
+    [[ "$mix" =~ ^([A-Z0-9.]+:[0-9]+\.[0-9]+,)*[A-Z0-9.]+:[0-9]+\.[0-9]+$ ]] || die "MIX tidak valid: ${mix:0:120}"
+    echo "$mix"
+}
+
+bench_show_popularity() {
+    LC_ALL=C awk -F, -v top="${2:-5}" '
+        NR > 1 && NR <= top + 1 { printf "      %2d. %-12s %-9s %6.2f%%\n", $1, $2, $3, $7 }
+        NR > 1 { s[$3] += $7; n[$3]++ }
+        END { printf "      per kelas:"; for (c in s) printf " %s %d instrumen %.1f%%;", c, n[c], s[c]; print "" }' "$1"
+}
+
+# Pratinjau distribusi beban tanpa memulai apa pun.
+bench_plan() {
+    local tmp
+    import_env "$RUN_ENV"
+    tmp=$(mktemp -d)
+    bench_popularity "$tmp"
+    echo "Distribusi popularitas (Zipf s=${BENCH_ZIPF_S:-1}) atas $(($(wc -l < "$tmp/popularity.csv") - 1)) instrumen:"
+    bench_show_popularity "$tmp/popularity.csv" 1000
+    echo "MIX k6 (awal): $(bench_mix "$tmp/popularity.csv" | cut -c1-110)..."
+    rm -rf "$tmp"
+}
+
 bench_start() {
     local duration="${1:-7d}" rate="${2:-6}" secs
     secs=$(duration_seconds "$duration") || die "Durasi harus seperti 7d, 168h, atau 30m (bukan: $duration)"
@@ -241,6 +308,7 @@ bench_start() {
         die "Benchmark masih berjalan: ./ta-up.sh bench status (hentikan: ./ta-up.sh bench stop)"
     fi
     import_env "$RUN_ENV"
+    echo "Memeriksa prasyarat..."
 
     # k6: biner lokal kalau terpasang, kalau tidak image docker (tanpa perlu menambah repo apt k6)
     local k6mode=docker image="${K6_IMAGE:-grafana/k6:1.0.0}"
@@ -262,11 +330,17 @@ bench_start() {
     if (( free_gb < 10 )); then
         problems+=("Ruang disk tersisa ${free_gb} GB. Satu minggu menambah beberapa GB ke database; sisakan >= 10 GB")
     fi
-    stale=$(psql_q -c "SELECT coalesce(extract(epoch FROM now() - max(o.ts))::int, 999999)
-        FROM ohlcv o JOIN instruments i ON i.id = o.instrument_id
-        WHERE o.timeframe = '1h' AND i.source <> 'yahoo'") || die "Database tidak bisa dibaca (docker ps: ta_postgres jalan?)"
-    if (( stale > 7200 )); then
-        problems+=("Candle 1h kripto/komoditas terakhir berumur $((stale / 3600)) jam. Jalankan ./ta-up.sh ingest dan cek cron")
+    # Per instrumen (bukan gabungan): spot yang segar tidak boleh menutupi futures yang basi.
+    # Kripto/komoditas berjalan 24 jam; > 3 jam = ingest gagal lebih dari sekali berturut-turut.
+    stale=$(psql_q -c "SELECT coalesce(string_agg(i.symbol || ' ' || coalesce(
+                (extract(epoch FROM now() - l.ts) / 3600)::int || ' jam', 'tanpa data'), ', ' ORDER BY i.symbol), '')
+        FROM instruments i
+        LEFT JOIN LATERAL (SELECT max(o.ts) AS ts FROM ohlcv o
+                           WHERE o.instrument_id = i.id AND o.timeframe = '1h') l ON true
+        WHERE i.source <> 'yahoo' AND (l.ts IS NULL OR l.ts < now() - interval '3 hours')") \
+        || die "Database tidak bisa dibaca (docker ps: ta_postgres jalan?)"
+    if [[ -n "$stale" ]]; then
+        problems+=("Candle 1h basi (> 3 jam): $stale. Cek ./ta-up.sh ingest dan logs/cron.log")
     fi
     if (( ${#problems[@]} > 0 )); then
         echo "Pemeriksaan sebelum benchmark:" >&2
@@ -277,51 +351,22 @@ bench_start() {
         echo "BENCH_FORCE=1: tetap dijalankan. Catat masalah di atas sebagai batasan." >&2
     fi
 
-    local id dir mix usdidr="${USDIDR_RATE:-16000}" zipf_s="${BENCH_ZIPF_S:-1}"
-    [[ "$usdidr" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "USDIDR_RATE tidak valid: $usdidr"
-    [[ "$zipf_s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "BENCH_ZIPF_S tidak valid: $zipf_s"
+    local id dir mix zipf_s="${BENCH_ZIPF_S:-1}"
     id=$(date -u +%Y%m%dT%H%M%SZ)
     dir="$BENCH_DIR/$id"
     mkdir -p "$BENCH_DIR"
     mkdir "$dir" || die "Folder run $dir sudah ada"
     cp "$RUN_ENV" "$dir/run.env"
-
-    # Popularitas (MIX k6): Zipf atas semua instrumen yang punya data, dibekukan di awal run.
-    # Peringkat dalam tiap kelas aset = rata-rata nilai transaksi harian 30 hari; antar kelas disusun
-    # bergiliran (kripto, saham, komoditas). Nilai transaksi tidak dibandingkan lintas kelas karena
-    # volume futures (komoditas) adalah nilai nosional ber-leverage: diurutkan langsung, komoditas
-    # memenuhi peringkat atas. BENCH_MIX="SIMBOL:bobot,..." untuk distribusi lain.
     if [[ -n "${BENCH_MIX:-}" ]]; then
         mix="$BENCH_MIX"
     else
-        psql_q -v rate="$usdidr" > "$dir/turnover.txt" << 'SQL' || die "Gagal menghitung peringkat popularitas"
-WITH t AS (
-    SELECT i.symbol, i.asset_type,
-           round(avg(o.close * o.volume / CASE WHEN i.source = 'yahoo' THEN :rate ELSE 1 END))::bigint AS usd
-    FROM instruments i
-    JOIN ohlcv o ON o.instrument_id = i.id AND o.timeframe = '1d' AND o.ts >= now() - interval '30 days'
-    WHERE EXISTS (SELECT 1 FROM ohlcv h WHERE h.instrument_id = i.id AND h.timeframe = '1h'
-                  AND h.ts >= now() - interval '7 days')
-    GROUP BY i.symbol, i.asset_type)
-SELECT symbol, asset_type, r, usd
-FROM (SELECT t.*, row_number() OVER (PARTITION BY asset_type ORDER BY usd DESC NULLS LAST, symbol) AS r FROM t) x
-ORDER BY r, array_position(ARRAY['crypto', 'stock', 'commodity'], asset_type), symbol;
-SQL
-        if (( $(wc -l < "$dir/turnover.txt") < 3 )); then
-            die "Instrumen dengan data terlalu sedikit untuk benchmark ($dir/turnover.txt)"
-        fi
-        awk -F'|' -v s="$zipf_s" '
-            { sym[NR] = $1; cls[NR] = $2; r[NR] = $3; t[NR] = $4; w[NR] = 1 / (NR ^ s); tot += w[NR] }
-            END {
-                print "rank,symbol,asset_type,rank_in_class,turnover_usd_30d,weight,share_pct"
-                for (i = 1; i <= NR; i++)
-                    printf "%d,%s,%s,%d,%s,%.6f,%.3f\n", i, sym[i], cls[i], r[i], t[i], w[i], w[i] / tot * 100
-            }' "$dir/turnover.txt" > "$dir/popularity.csv"
-        mix=$(awk -F, 'NR > 1 { printf "%s%s:%s", (NR > 2 ? "," : ""), $2, $6 }' "$dir/popularity.csv")
+        bench_popularity "$dir"
+        mix=$(bench_mix "$dir/popularity.csv")
     fi
 
-    if [[ "$k6mode" == docker ]]; then
-        docker image inspect "$image" > /dev/null 2>&1 || docker pull -q "$image" > /dev/null || die "Gagal mengunduh $image"
+    if [[ "$k6mode" == docker ]] && ! docker image inspect "$image" > /dev/null 2>&1; then
+        echo "Mengunduh image $image (sekali saja, ±30-70 MB)..."
+        docker pull "$image" || die "Gagal mengunduh $image. Coba manual: docker pull $image"
     fi
 
     echo "Menyiapkan lab stub (15 kondisi)..."
@@ -399,9 +444,7 @@ SQL
     echo "  Beban     : $rate kunjungan/menit x 3 metode, dikirim ke 15 kondisi sekaligus"
     if [[ -f "$dir/popularity.csv" ]]; then
         echo "  Popularitas (5 teratas dari $(($(wc -l < "$dir/popularity.csv") - 1)) instrumen, $dir/popularity.csv):"
-        awk -F, 'NR > 1 && NR <= 6 { printf "      %2d. %-12s %-9s %6.2f%%\n", $1, $2, $3, $7 }' "$dir/popularity.csv"
-        awk -F, 'NR > 1 { s[$3] += $7 } END { printf "      per kelas:"; for (c in s) printf " %s %.1f%%", c, s[c]; print "" }' \
-            "$dir/popularity.csv"
+        bench_show_popularity "$dir/popularity.csv" 5
     fi
     echo "  Pantau    : ./ta-up.sh bench status    (aman logout / SSH putus)"
     echo "  Hentikan  : ./ta-up.sh bench stop"
@@ -627,12 +670,15 @@ case "$ACTION" in
         esac
         ;;
     bench)
+        # Titik desimal untuk semua angka (awk/printf); locale id_ID memakai koma
+        export LC_ALL=C
         case "$ARG1" in
             start) bench_start "${ARG2:-7d}" "${ARG3:-6}" ;;
+            plan) bench_plan ;;
             stop) bench_stop ;;
             list) bench_list ;;
             status | "") bench_status "${ARG2:-current}" ;;
-            *) die "Pakai: ./ta-up.sh bench start [DURASI] [RATE] | status [ID] | stop | list" ;;
+            *) die "Pakai: ./ta-up.sh bench start [DURASI] [RATE] | plan | status [ID] | stop | list" ;;
         esac
         ;;
     status)
