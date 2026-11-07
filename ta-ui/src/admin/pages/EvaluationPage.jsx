@@ -166,32 +166,60 @@ function QuotaPanel({ data, rows, empty }) {
   );
 }
 
+// "2026-11-09T02:00:00Z" -> "20261109T0200Z" untuk nama file CSV
+const compactUtc = (iso) => (iso ?? "").replace(/[-:]/g, "").replace(/\d\dZ$/, "Z");
+
 export default function EvaluationPage() {
   // Filter awal bisa dari URL, mis. /admin/evaluation?prompt=stub&trigger=k6
-  const [params] = useSearchParams();
+  // Satu run benchmark: ?from=...&to=... (dicetak oleh ./ta-up.sh bench status) = jendela waktu tetap.
+  const [params, setParams] = useSearchParams();
   const [days, setDays] = useState(params.get("days") ?? "30");
   const [trigger, setTrigger] = useState(params.get("trigger") ?? "all");
   const [prompt, setPrompt] = useState(params.get("prompt") ?? "current");
   const [method, setMethod] = useState(params.get("method") ?? "all");
   const [thetaS, setThetaS] = useState("2");
+  const from = params.get("from") ?? "";
+  const to = params.get("to") ?? "";
   const { data, error, loading, reload } = useApi(
-    (signal) => getAdminEvaluation({ days, trigger, prompt, method }, signal),
-    [days, trigger, prompt, method]
+    (signal) =>
+      getAdminEvaluation({ days, trigger, prompt, method, ...(from && { from }), ...(to && { to }) }, signal),
+    [days, trigger, prompt, method, from, to]
   );
   const rows = data?.conditions ?? [];
   const base = rows.find((r) => r.condition === "no_cache");
   const empty = data && rows.length === 0 ? "Belum ada data untuk filter ini." : null;
+  const clearWindow = () => {
+    const next = new URLSearchParams(params);
+    next.delete("from");
+    next.delete("to");
+    setParams(next, { replace: true });
+  };
+  const csvName = data?.fixed_window
+    ? `evaluasi-${compactUtc(data.from)}-${compactUtc(data.to)}-${data.trigger}-${data.method}.csv`
+    : `evaluasi-${data?.days}hari-${data?.trigger}-${data?.method}.csv`;
 
   return (
     <div className="space-y-6">
       <PageHeader title="Evaluasi eksperimen" subtitle="Latency, cost token, dan freshness per kondisi (metrik Bab 2.7)">
-        <Segmented label="Rentang" value={days} options={RANGES} onChange={setDays} />
+        {from ? (
+          <div className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-xs">
+            <span className="text-muted">Jendela run</span>
+            <span className="font-semibold text-ink">
+              {fmtDateTime(data?.from ?? from)} – {fmtDateTime(data?.to ?? (to || undefined))}
+            </span>
+            <button onClick={clearWindow} className="text-muted underline hover:text-ink">
+              Hapus
+            </button>
+          </div>
+        ) : (
+          <Segmented label="Rentang" value={days} options={RANGES} onChange={setDays} />
+        )}
         <Select label="Sumber" value={trigger} options={SOURCES} onChange={setTrigger} />
         <Select label="Prompt" value={prompt} options={PROMPTS} onChange={setPrompt} />
         <Select label="Metode" value={method} options={METHOD_FILTER} onChange={setMethod} />
         {rows.length > 0 && (
           <button
-            onClick={() => downloadCsv(rows, `evaluasi-${data.days}hari-${data.trigger}-${data.method}.csv`)}
+            onClick={() => downloadCsv(rows, csvName)}
             className="rounded-lg border border-line px-3 py-2 text-xs font-semibold text-muted hover:text-ink"
           >
             Unduh CSV

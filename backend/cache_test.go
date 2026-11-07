@@ -159,10 +159,12 @@ func TestRealizedVolatility(t *testing.T) {
 
 func TestInstanceKey(t *testing.T) {
 	cases := map[string]policyConfig{
-		"no_cache":       {mode: "no_cache"},
-		"hybrid-2":       {mode: "hybrid", threshold: 2},
-		"hybrid-2-pg":    {mode: "hybrid", threshold: 2, pregen: true},
-		"event_only-0.5": {mode: "event_only", threshold: 0.5},
+		"no_cache":        {mode: "no_cache"},
+		"hybrid-2":        {mode: "hybrid", threshold: 2},
+		"hybrid-2-pg":     {mode: "hybrid", threshold: 2, pregen: true},
+		"event_only-0.5":  {mode: "event_only", threshold: 0.5},
+		"lab.hybrid-2-pg": {mode: "hybrid", threshold: 2, pregen: true, namespace: "lab"},
+		"lab.no_cache":    {mode: "no_cache", namespace: "lab"},
 	}
 	for want, c := range cases {
 		if got := c.instanceKey(); got != want {

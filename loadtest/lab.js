@@ -4,16 +4,19 @@
 // dikirim ke semua instance kondisi (.\ta-up.ps1 lab start) secara bersamaan, sehingga setiap
 // kondisi menerima urutan request dan kondisi pasar yang identik.
 //
-// Pasang k6:  winget install k6 --source winget
-// Jalankan :  k6 run loadtest/lab.js
+// Eksperimen utama (server): ./ta-up.sh bench start   -> lab stub + k6 7 hari di background, MIX Zipf
+// atas semua instrumen, jendela run dicatat di logs/bench/. Lihat docs/CHECKPOINT.md "Benchmark 1 minggu".
+//
+// Manual:     k6 run loadtest/lab.js
 //             k6 run -e RATE=12 -e DURATION=24h loadtest/lab.js
+// Pasang k6:  winget install k6 --source winget (Windows); di server bench memakai image docker grafana/k6
 //
 // Parameter (-e NAMA=nilai):
 //   RATE      iterasi per menit (default 6 = satu request tiap 10 detik ke setiap kondisi)
-//   DURATION  lama uji, format k6 (default 1h; eksperimen utama mis. 72h atau 168h)
+//   DURATION  lama uji, format k6 (default 1h; eksperimen utama 168h = 1 minggu, lewat bench)
 //   PORTS     daftar port dipisah koma (default 8101-8115, sama dengan matriks lab)
 //   HOST      default 127.0.0.1 (jangan "localhost": di Windows menambah ~200 ms lewat IPv6)
-//   MIX       distribusi popularitas "SIMBOL:bobot,..." (default di bawah)
+//   MIX       distribusi popularitas "SIMBOL:bobot,..." (default di bawah; bench mengisi Zipf)
 //   METHODS   metode analisis per kunjungan, dipisah koma (default debate,mtf,grounded)
 import http from "k6/http";
 import { check } from "k6";
@@ -40,8 +43,12 @@ export const options = {
       duration: __ENV.DURATION || "1h",
       preAllocatedVUs: 20,
       maxVUs: 200,
+      // Kunjungan terakhir dibiarkan selesai (AI no_cache bisa puluhan detik), bukan diputus di 30 dtk.
+      gracefulStop: "6m",
     },
   },
+  // Isi respons tidak dipakai (cek hanya status); tanpa ini k6 menahan ratusan ribu body selama seminggu.
+  discardResponseBodies: true,
   // Semua request satu kunjungan (15 port x 3 metode = 45) harus berangkat bersamaan supaya setiap kondisi
   // menerima request pada saat dan kondisi pasar yang sama. Default k6 hanya 10 paralel per batch (6 per
   // host): dengan latency AI realistis (stub profil pilot 12-22 dtk) sisanya antre puluhan detik.

@@ -232,6 +232,8 @@ switch ($Action) {
                 Import-EnvFile (Join-Path $Root ".env")
                 Import-EnvFile $RunEnv
                 $env:AI_MODE = if ($AiMode) { $AiMode } else { "stub" }
+                # key Redis lab terpisah dari backend utama (lab.hybrid-2-pg vs hybrid-2-pg)
+                $env:CACHE_NAMESPACE = "lab"
                 if ((Get-Health "http://127.0.0.1:8000/health") -eq "DOWN" -and $env:AI_MODE -eq "http") { Start-Api }
                 foreach ($c in $LabMatrix) {
                     $env:PORT = "$($c.Port)"

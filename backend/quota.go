@@ -71,8 +71,8 @@ func quotaProvider() string {
 	return env("QUOTA_PROVIDER", env("HERMES_PROVIDER", "openai-codex"))
 }
 
-// quotaSummary: konsumsi kuota per jendela dalam `days` hari terakhir. nil kalau belum ada snapshot.
-func (a *App) quotaSummary(ctx context.Context, days int) (*quotaInfo, error) {
+// quotaSummary: konsumsi kuota per jendela dari snapshot di [since, until). nil kalau belum ada snapshot.
+func (a *App) quotaSummary(ctx context.Context, since, until time.Time) (*quotaInfo, error) {
 	q := &quotaInfo{Provider: quotaProvider(), Currency: env("SUBSCRIPTION_CURRENCY", "USD")}
 	if fee, err := strconv.ParseFloat(env("SUBSCRIPTION_FEE_MONTHLY", ""), 64); err == nil && fee > 0 {
 		q.FeeMonthly = &fee
@@ -80,8 +80,8 @@ func (a *App) quotaSummary(ctx context.Context, days int) (*quotaInfo, error) {
 	rows, err := a.store.pool.Query(ctx, `
 		SELECT window_label, fetched_at, used_percent::float8, resets_at, plan
 		FROM quota_snapshots
-		WHERE provider = $1 AND used_percent IS NOT NULL AND fetched_at >= now() - make_interval(days => $2)
-		ORDER BY window_label, fetched_at`, q.Provider, days)
+		WHERE provider = $1 AND used_percent IS NOT NULL AND fetched_at >= $2 AND fetched_at < $3
+		ORDER BY window_label, fetched_at`, q.Provider, since, until)
 	if err != nil {
 		return nil, err
 	}

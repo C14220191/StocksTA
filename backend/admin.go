@@ -788,12 +788,49 @@ func groupKey(cond string, th *float64, pg bool) string {
 	return fmt.Sprintf("%s|%v|%v", cond, f64(th), pg)
 }
 
+// evalWindow: jendela waktu evaluasi [from, to). Tanpa ?from= = `days` hari terakhir sampai sekarang
+// (atau sampai ?to=). Dengan ?from=&to= (RFC3339, mis. 2026-11-09T02:00:00Z) jendelanya tetap, jadi
+// hasil satu run benchmark (./ta-up.sh bench) sama kapan pun dibuka dan tidak tercampur uji coba lain.
+func evalWindow(c echo.Context, days int, now time.Time) (from, to time.Time, err error) {
+	parse := func(name string) (time.Time, error) {
+		// "+" pada offset zona waktu berubah menjadi spasi kalau tidak di-encode di URL
+		t, err := time.Parse(time.RFC3339, strings.ReplaceAll(c.QueryParam(name), " ", "+"))
+		if err != nil {
+			return t, fmt.Errorf("%s harus format RFC3339, mis. 2026-11-09T02:00:00Z", name)
+		}
+		return t, nil
+	}
+	to = now
+	if c.QueryParam("to") != "" {
+		if to, err = parse("to"); err != nil {
+			return
+		}
+	}
+	if c.QueryParam("from") == "" {
+		return to.AddDate(0, 0, -days), to, nil
+	}
+	if from, err = parse("from"); err != nil {
+		return
+	}
+	if !from.Before(to) {
+		err = errors.New("from harus sebelum to")
+	}
+	return
+}
+
 // GET /api/admin/evaluation?days=30&trigger=all&prompt=current|all&method=all|debate|mtf|grounded
+//
+//	[&from=RFC3339&to=RFC3339]
+//
 // Agregasi per kondisi eksperimen: bahan tabel dan kurva trade-off Bab 4. method menyaring semua
 // metrik ke satu metode analisis (all = gabungan; satu kunjungan halaman = satu request per metode).
 func (a *App) AdminEvaluation(c echo.Context) error {
 	ctx := c.Request().Context()
 	days := queryInt(c, "days", 30, 1, 3650)
+	from, to, err := evalWindow(c, days, time.Now())
+	if err != nil {
+		return badRequest(c, err)
+	}
 	trig := strings.ToLower(c.QueryParam("trigger"))
 	if trig == "" {
 		trig = "all"
@@ -819,8 +856,8 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 	if method != "all" && method != "summary" && !validMethod(method) {
 		return badRequest(c, errors.New("method harus all, summary, atau salah satu dari "+methodsList))
 	}
-	// $1 hari, $2 trigger, $3 prompt, $4 metode; request pengguna = semua trigger kecuali scheduled.
-	const reqFilter = `created_at >= now() - make_interval(days => $1)
+	// $1 from, $2 trigger, $3 prompt, $4 metode, $5 to; request pengguna = semua trigger kecuali scheduled.
+	const reqFilter = `created_at >= $1 AND created_at < $5
 		AND trigger <> 'scheduled' AND ($2 = 'all' OR trigger = $2)
 		AND ($3 = '' OR prompt_version = $3) AND ($4 = 'all' OR method = $4)`
 
@@ -855,7 +892,7 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		WHERE `+reqFilter+`
 		GROUP BY 1, 2, 3
 		ORDER BY array_position(ARRAY['no_cache','static_ttl','dynamic_ttl','event_only','hybrid'], experiment_condition), 2, 3`,
-		days, trig, prompt, method)
+		from, trig, prompt, method, to)
 	if err != nil {
 		return a.fail(c, err)
 	}
@@ -899,11 +936,11 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		       count(*), count(*) FILTER (WHERE cache_status = 'PREGEN'),
 		       coalesce(sum(tokens_in), 0), coalesce(sum(tokens_out), 0), coalesce(sum(cost_usd), 0)::float8
 		FROM inference_log
-		WHERE created_at >= now() - make_interval(days => $1) AND ($3 = '' OR prompt_version = $3)
+		WHERE created_at >= $1 AND created_at < $5 AND ($3 = '' OR prompt_version = $3)
 		  AND ($4 = 'all' OR method = $4)
 		  AND (cache_status = 'PREGEN'
 		       OR (cache_status IN ('MISS', 'BYPASS') AND trigger <> 'scheduled' AND ($2 = 'all' OR trigger = $2)))
-		GROUP BY 1, 2, 3`, days, trig, prompt, method); err != nil {
+		GROUP BY 1, 2, 3`, from, trig, prompt, method, to); err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
@@ -923,25 +960,27 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 	rows.Close()
 
 	// Wasted inference: entri pregen yang masa hidupnya sudah berakhir (kedaluwarsa atau tergantikan
-	// generate berikutnya) dan tidak pernah disajikan sebagai HIT ke pengguna.
+	// generate berikutnya) sebelum akhir jendela dan tidak pernah disajikan sebagai HIT ke pengguna
+	// di dalam jendela.
 	if rows, err = a.store.pool.Query(ctx, `
 		WITH gens AS (
 		    SELECT experiment_condition, invalidation_threshold_pct, pregen, summary_id, cache_status,
 		           coalesce(lead(created_at) OVER (
 		                        PARTITION BY experiment_condition, invalidation_threshold_pct, pregen, instrument_id, method
 		                        ORDER BY created_at),
-		                    created_at + make_interval(secs => coalesce(ttl_applied_seconds, 0))) <= now() AS ended
+		                    created_at + make_interval(secs => coalesce(ttl_applied_seconds, 0))) <= $4 AS ended
 		    FROM inference_log
-		    WHERE cache_status IN ('MISS', 'PREGEN') AND created_at >= now() - make_interval(days => $1)
+		    WHERE cache_status IN ('MISS', 'PREGEN') AND created_at >= $1 AND created_at < $4
 		      AND ($2 = '' OR prompt_version = $2) AND ($3 = 'all' OR method = $3)
 		)
 		SELECT experiment_condition, invalidation_threshold_pct::float8, pregen,
 		       count(*) FILTER (WHERE ended),
 		       count(*) FILTER (WHERE ended AND NOT EXISTS (
 		           SELECT 1 FROM inference_log h
-		           WHERE h.summary_id = gens.summary_id AND h.cache_status = 'HIT' AND h.trigger <> 'scheduled'))
+		           WHERE h.summary_id = gens.summary_id AND h.cache_status = 'HIT' AND h.trigger <> 'scheduled'
+		             AND h.created_at < $4))
 		FROM gens WHERE cache_status = 'PREGEN'
-		GROUP BY 1, 2, 3`, days, prompt, method); err != nil {
+		GROUP BY 1, 2, 3`, from, prompt, method, to); err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
@@ -968,9 +1007,9 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		       percentile_cont(0.5) WITHIN GROUP (ORDER BY invalidation_latency_ms),
 		       percentile_cont(0.95) WITHIN GROUP (ORDER BY invalidation_latency_ms)
 		FROM cache_events
-		WHERE experiment_condition IS NOT NULL AND created_at >= now() - make_interval(days => $1)
+		WHERE experiment_condition IS NOT NULL AND created_at >= $1 AND created_at < $3
 		  AND ($2 = 'all' OR coalesce(method, 'summary') = $2)
-		GROUP BY 1, 2, 3`, days, method); err != nil {
+		GROUP BY 1, 2, 3`, from, method, to); err != nil {
 		return a.fail(c, err)
 	}
 	for rows.Next() {
@@ -1021,9 +1060,9 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 		       avg((s.price_after_24h / s.price_at_generation - 1) * 100)::float8
 		FROM ai_summaries s JOIN instruments i ON i.id = s.instrument_id
 		WHERE s.signal_correct IS NOT NULL
-		  AND s.generated_at >= now() - make_interval(days => $1)
+		  AND s.generated_at >= $1 AND s.generated_at < $4
 		  AND ($2 = '' OR s.prompt_version = $2) AND ($3 = 'all' OR s.method = $3)
-		GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, days, prompt, method)
+		GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, from, prompt, method, to)
 	if err != nil {
 		return a.fail(c, err)
 	}
@@ -1038,10 +1077,12 @@ func (a *App) AdminEvaluation(c echo.Context) error {
 
 	resp := map[string]any{
 		"days": days, "trigger": trig, "prompt_version": prompt, "method": method, "ssr_thresholds": ssrThresholds,
-		"conditions": out, "accuracy": acc,
+		"from": from.UTC().Format(time.RFC3339), "to": to.UTC().Format(time.RFC3339),
+		"fixed_window": c.QueryParam("from") != "",
+		"conditions":   out, "accuracy": acc,
 	}
 	// Kuota langganan: pelengkap, tidak menggagalkan evaluasi (mis. migrasi 010 belum dijalankan).
-	if quota, err := a.quotaSummary(ctx, days); err != nil {
+	if quota, err := a.quotaSummary(ctx, from, to); err != nil {
 		resp["quota_error"] = "kuota langganan tidak bisa dibaca (migrasi 010_quota.sql sudah dijalankan?): " + truncate(err.Error(), 160)
 	} else {
 		applyQuota(out, quota)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -77,10 +78,16 @@ type policyConfig struct {
 	threshold  float64 // θ; 0 = tanpa event invalidation
 	checkState bool    // pemeriksaan ketiga (S berubah)
 	pregen     bool
+	namespace  string // CACHE_NAMESPACE, mis. "lab": instance lab tidak berbagi entri dengan backend utama
 }
 
+var reNamespace = regexp.MustCompile(`^[a-z0-9_]{1,16}$`)
+
 // instanceKey membedakan entri Redis antar instance yang berjalan paralel (live paralel),
-// mis. "hybrid-2-pg" = hybrid, θ 2%, dengan pre-generation.
+// mis. "hybrid-2-pg" = hybrid, θ 2%, dengan pre-generation; "lab.hybrid-2-pg" untuk instance lab.
+// Tanpa namespace, backend utama dan instance lab dengan kondisi yang sama memakai key yang sama:
+// cache dan popularitas pre-generation saling tercampur (summary stub tersaji di UI, dan pregen
+// backend utama memanggil AI sungguhan untuk instrumen yang populer karena beban k6).
 func (c policyConfig) instanceKey() string {
 	k := c.mode
 	if c.threshold > 0 {
@@ -89,11 +96,18 @@ func (c policyConfig) instanceKey() string {
 	if c.pregen {
 		k += "-pg"
 	}
+	if c.namespace != "" {
+		k = c.namespace + "." + k
+	}
 	return k
 }
 
 func loadPolicyConfig() (policyConfig, error) {
-	c := policyConfig{mode: env("CACHE_MODE", "no_cache"), pregen: env("PREGEN", "off") == "on"}
+	c := policyConfig{mode: env("CACHE_MODE", "no_cache"), pregen: env("PREGEN", "off") == "on",
+		namespace: env("CACHE_NAMESPACE", "")}
+	if c.namespace != "" && !reNamespace.MatchString(c.namespace) {
+		return c, fmt.Errorf("CACHE_NAMESPACE tidak valid: %q (huruf kecil, angka, _; maks 16)", c.namespace)
+	}
 	switch c.mode {
 	case "no_cache", "static_ttl", "dynamic_ttl", "event_only", "hybrid":
 	default:
