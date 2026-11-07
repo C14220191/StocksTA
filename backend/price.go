@@ -58,6 +58,12 @@ type marketStream struct {
 	url     string // WebSocket
 	restURL string // REST ticker/price untuk harga awal
 	symbols []string
+	// Klien HTTP khusus handshake WebSocket market ini. Setelah handshake gagal, koneksi idle-nya
+	// ditutup (dialFresh): library membaca habis halaman error (mis. 403 dari CDN Binance) lalu Go
+	// menyimpan koneksi TCP/TLS itu di kolam, sehingga tanpa ini setiap percobaan ulang memakai
+	// koneksi yang sama ke edge yang sama dan terus ditolak. Teramati di server 7 Nov: backend
+	// utama gagal 315x berturut-turut (403) sementara proses lain dari IP yang sama tersambung.
+	client *http.Client
 
 	mu         sync.Mutex
 	connected  bool
@@ -252,10 +258,16 @@ func (f *PriceFeed) stream(ctx context.Context, m *marketStream) {
 // read membaca satu koneksi sampai putus. Binance memutus koneksi setiap 24 jam; ping/pong
 // ditangani library selama Read berjalan.
 func (f *PriceFeed) read(ctx context.Context, m *marketStream, url string) error {
+	if m.client == nil {
+		m.client = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+	}
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	c, _, err := websocket.Dial(dctx, url, nil)
+	c, _, err := websocket.Dial(dctx, url, &websocket.DialOptions{HTTPClient: m.client})
 	cancel()
 	if err != nil {
+		// Percobaan berikutnya wajib membuka koneksi (dan resolusi DNS) baru, bukan memakai ulang
+		// koneksi yang baru saja ditolak.
+		m.client.CloseIdleConnections()
 		return err
 	}
 	defer c.CloseNow()

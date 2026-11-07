@@ -242,17 +242,28 @@ bench_running() {
 # memenuhi peringkat atas. BENCH_MIX="SIMBOL:bobot,..." untuk distribusi lain.
 # Menulis <dir>/turnover.txt dan <dir>/popularity.csv. Angka selalu memakai titik desimal
 # (LC_ALL=C): dengan locale id_ID awk menulis "0,500000" sehingga kolom CSV dan bobot k6 rusak.
+# Kelas aset yang ikut beban benchmark: BENCH_ASSET_TYPES (default semua). Mis. crypto,stock saat
+# endpoint futures Binance (komoditas) tidak stabil dari jaringan server (7 Nov: 403 / connection reset).
+bench_types() {
+    local t="${BENCH_ASSET_TYPES:-crypto,stock,commodity}"
+    [[ "$t" =~ ^(crypto|stock|commodity)(,(crypto|stock|commodity))*$ ]] \
+        || die "BENCH_ASSET_TYPES tidak valid: $t (pilihan: crypto,stock,commodity)"
+    echo "$t"
+}
+
 bench_popularity() {
-    local dir="$1" usdidr="${USDIDR_RATE:-16000}" zipf_s="${BENCH_ZIPF_S:-1}"
+    local dir="$1" usdidr="${USDIDR_RATE:-16000}" zipf_s="${BENCH_ZIPF_S:-1}" types
+    types=$(bench_types)
     [[ "$usdidr" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "USDIDR_RATE tidak valid: $usdidr"
     [[ "$zipf_s" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "BENCH_ZIPF_S tidak valid: $zipf_s"
-    psql_q -v rate="$usdidr" > "$dir/turnover.txt" << 'SQL' || die "Gagal menghitung peringkat popularitas"
+    psql_q -v rate="$usdidr" -v types="$types" > "$dir/turnover.txt" << 'SQL' || die "Gagal menghitung peringkat popularitas"
 WITH t AS (
     SELECT i.symbol, i.asset_type,
            round(avg(o.close * o.volume / CASE WHEN i.source = 'yahoo' THEN :rate ELSE 1 END))::bigint AS usd
     FROM instruments i
     JOIN ohlcv o ON o.instrument_id = i.id AND o.timeframe = '1d' AND o.ts >= now() - interval '30 days'
-    WHERE EXISTS (SELECT 1 FROM ohlcv h WHERE h.instrument_id = i.id AND h.timeframe = '1h'
+    WHERE i.asset_type = ANY (string_to_array(:'types', ','))
+      AND EXISTS (SELECT 1 FROM ohlcv h WHERE h.instrument_id = i.id AND h.timeframe = '1h'
                   AND h.ts >= now() - interval '7 days')
     GROUP BY i.symbol, i.asset_type)
 SELECT symbol, asset_type, r, usd
@@ -316,7 +327,8 @@ bench_start() {
     if command -v k6 > /dev/null; then k6mode=native; fi
 
     # Hal yang membuat data seminggu cacat. BENCH_FORCE=1 untuk tetap jalan (catat sebagai batasan).
-    local problems=() main free_gb stale
+    local problems=() main free_gb stale types
+    types=$(bench_types)
     main=$(curl -fsS -m 3 http://127.0.0.1:8080/health 2>/dev/null | grep -o '"cache_mode":"[^"]*"' | cut -d'"' -f4 || true)
     if [[ -n "$main" && "$main" != "no_cache" ]]; then
         problems+=("Backend utama (:8080) berjalan dengan $main. Evaluasi mengelompokkan per kondisi, jadi pre-generation dan cache_events-nya ikut terhitung di kondisi lab yang sama. Pilih: ./ta-up.sh stop, atau ./ta-up.sh restart no_cache (UI tetap bisa dipakai)")
@@ -338,7 +350,8 @@ bench_start() {
         FROM instruments i
         LEFT JOIN LATERAL (SELECT max(o.ts) AS ts FROM ohlcv o
                            WHERE o.instrument_id = i.id AND o.timeframe = '1h') l ON true
-        WHERE i.source <> 'yahoo' AND (l.ts IS NULL OR l.ts < now() - interval '3 hours')") \
+        WHERE i.source <> 'yahoo' AND (l.ts IS NULL OR l.ts < now() - interval '3 hours')
+          AND i.asset_type = ANY (string_to_array('$types', ','))") \
         || die "Database tidak bisa dibaca (docker ps: ta_postgres jalan?)"
     if [[ -n "$stale" ]]; then
         problems+=("Candle 1h basi (> 3 jam): $stale. Cek ./ta-up.sh ingest dan logs/cron.log")
@@ -416,6 +429,7 @@ bench_start() {
         echo "K6=$k6ver"
         echo "GIT_COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)$(git -C "$ROOT" diff --quiet HEAD 2>/dev/null || echo -dirty)"
         echo "FORCED=${BENCH_FORCE:-0}"
+        echo "ASSET_TYPES=$types"
     } > "$dir/run.meta"
     # Pembungkus: jalankan k6, catat akhir run, lalu matikan lab supaya tidak ada data di luar jendela.
     {
