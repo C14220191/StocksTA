@@ -4,8 +4,8 @@
 // dikirim ke semua instance kondisi (.\ta-up.ps1 lab start) secara bersamaan, sehingga setiap
 // kondisi menerima urutan request dan kondisi pasar yang identik.
 //
-// Eksperimen utama (server): ./ta-up.sh bench start   -> lab stub + k6 7 hari di background, MIX Zipf
-// atas semua instrumen, jendela run dicatat di logs/bench/. Lihat docs/CHECKPOINT.md "Benchmark 1 minggu".
+// Eksperimen utama (server): ./ta-up.sh bench start   -> lab stub + k6 5 hari di background, MIX Zipf
+// atas semua instrumen, jendela run dicatat di logs/bench/. Lihat docs/CHECKPOINT.md "Benchmark".
 //
 // Manual:     k6 run loadtest/lab.js
 //             k6 run -e RATE=12 -e DURATION=24h loadtest/lab.js
@@ -13,7 +13,7 @@
 //
 // Parameter (-e NAMA=nilai):
 //   RATE      iterasi per menit (default 6 = satu request tiap 10 detik ke setiap kondisi)
-//   DURATION  lama uji, format k6 (default 1h; eksperimen utama 168h = 1 minggu, lewat bench)
+//   DURATION  lama uji, format k6 (default 1h; eksperimen utama 5 hari (120h), lewat bench)
 //   PORTS     daftar port dipisah koma (default 8101-8115, sama dengan matriks lab)
 //   HOST      default 127.0.0.1 (jangan "localhost": di Windows menambah ~200 ms lewat IPv6)
 //   MIX       distribusi popularitas "SIMBOL:bobot,..." (default di bawah; bench mengisi Zipf)

@@ -24,7 +24,7 @@
 #   ./ta-up.sh lab stop
 #
 # Benchmark (eksperimen utama Bab 4): lab stub + k6 di background, aman ditinggal / SSH putus.
-#   ./ta-up.sh bench start [DURASI] [RATE]    # default 7d (1 minggu), 6 kunjungan/menit; uji singkat: 30m
+#   ./ta-up.sh bench start [DURASI] [RATE]    # default 5d (keputusan 7 Nov), 6 kunjungan/menit; uji singkat: 30m
 #   ./ta-up.sh bench plan                     # pratinjau distribusi popularitas (Zipf) tanpa memulai apa pun
 #   ./ta-up.sh bench status [ID]              # progres, request per kondisi, link Evaluasi untuk jendela run
 #   ./ta-up.sh bench stop                     # hentikan lebih awal (jendela run tetap tercatat)
@@ -302,7 +302,7 @@ bench_plan() {
 }
 
 bench_start() {
-    local duration="${1:-7d}" rate="${2:-6}" secs
+    local duration="${1:-5d}" rate="${2:-6}" secs
     secs=$(duration_seconds "$duration") || die "Durasi harus seperti 7d, 168h, atau 30m (bukan: $duration)"
     [[ "$rate" =~ ^[1-9][0-9]*$ ]] || die "RATE harus bilangan bulat > 0 (kunjungan per menit)"
     if bench_running; then
@@ -681,7 +681,7 @@ case "$ACTION" in
         # Titik desimal untuk semua angka (awk/printf); locale id_ID memakai koma
         export LC_ALL=C
         case "$ARG1" in
-            start) bench_start "${ARG2:-7d}" "${ARG3:-6}" ;;
+            start) bench_start "${ARG2:-5d}" "${ARG3:-6}" ;;
             plan) bench_plan ;;
             stop) bench_stop ;;
             list) bench_list ;;
