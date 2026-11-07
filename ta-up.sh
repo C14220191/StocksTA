@@ -8,6 +8,7 @@
 #                                             # contoh: ./ta-up.sh restart hybrid http 2 on
 #   ./ta-up.sh stop
 #   ./ta-up.sh ingest                         # ambil data terbaru (dipanggil cron tiap jam)
+#   ./ta-up.sh ingest-retry                   # ulangi hanya yang gagal jam ini (cron menit ke-35)
 #   ./ta-up.sh backtest                       # isi price_after_24h + signal_correct (dipanggil cron)
 #   ./ta-up.sh fundamentals                   # fundamental saham dari Yahoo (cron harian)
 #   ./ta-up.sh quota                          # snapshot kuota langganan AI (cron tiap 10 menit saat eksperimen)
@@ -607,6 +608,13 @@ case "$ACTION" in
         import_env "$ROOT/.env"
         run_py ingest.py --timeframe 1h
         run_py ingest.py --timeframe 1d
+        ;;
+    ingest-retry)
+        # Cron menit ke-35: hanya instrumen yang ingest jam ini gagal (fapi.binance.com dari jaringan
+        # server sesekali menolak). Yang sudah berhasil tidak disentuh, jadi harga saham tetap per jam.
+        import_env "$ROOT/.env"
+        run_py ingest.py --timeframe 1h --retry-failed
+        run_py ingest.py --timeframe 1d --retry-failed
         ;;
     backtest)
         import_env "$ROOT/.env"

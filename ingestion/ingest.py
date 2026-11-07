@@ -5,6 +5,7 @@ Pemakaian:
     python ingestion/ingest.py --timeframe 1d
     python ingestion/ingest.py --timeframe 1h --backfill   # isi ulang sekitar 1 tahun (jalankan sekali)
     python ingestion/ingest.py --timeframe 1d --backfill
+    python ingestion/ingest.py --timeframe 1h --retry-failed  # ulangi yang gagal jam ini (menit ke-35)
 
 Instrument yang diambil = isi tabel instruments (kolom source: yahoo | binance | binance_futures),
 jadi menambah instrument cukup lewat migrasi/INSERT, tanpa mengubah file ini.
@@ -135,6 +136,9 @@ def main():
     ap.add_argument("--backfill", action="store_true", help="isi ulang sekitar 1 tahun")
     ap.add_argument("--symbols", help="daftar simbol dipisah koma (default: semua instrument). "
                                       "Dipakai backend saat instrumen ditambahkan lewat halaman admin")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="hanya instrumen yang ingest terakhirnya di jam ini gagal (cron menit ke-35). "
+                         "Instrumen yang sudah berhasil tidak diambil ulang, jadi harga saham tetap per jam")
     args = ap.parse_args()
 
     if not DATABASE_URL:
@@ -149,6 +153,18 @@ def main():
     if args.symbols:
         wanted = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
         instruments = [row for row in instruments if row[0] in wanted]
+    if args.retry_failed:
+        # Status terakhir per instrumen sejak awal jam ini; yang terakhir gagal diambil ulang.
+        # Mis. fapi.binance.com dari jaringan server sesekali 403 / connection reset.
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT ON (target) target, status FROM job_runs "
+                "WHERE job = %s AND started_at >= date_trunc('hour', now()) "
+                "ORDER BY target, started_at DESC", (f"ingest_{args.timeframe}",))
+            failed = {target for target, status in cur.fetchall() if status == "fail"}
+        instruments = [row for row in instruments if row[0] in failed]
+        print(f"[retry] {args.timeframe}: {len(instruments)} instrumen gagal jam ini"
+              + (": " + ", ".join(row[0] for row in instruments) if instruments else ""))
     upsert = UPSERT_SQL.format(interval=INTERVAL_SQL[args.timeframe])
 
     fetchers = {
