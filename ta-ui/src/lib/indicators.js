@@ -64,9 +64,9 @@ function rmaCore(v, n) {
   return out;
 }
 
-export const sma = (v, n) => onValid(v, (x) => smaCore(x, n));
-export const ema = (v, n) => onValid(v, (x) => emaCore(x, n));
-export const rma = (v, n) => onValid(v, (x) => rmaCore(x, n));
+const sma = (v, n) => onValid(v, (x) => smaCore(x, n));
+const ema = (v, n) => onValid(v, (x) => emaCore(x, n));
+const rma = (v, n) => onValid(v, (x) => rmaCore(x, n));
 
 const highest = (v, i, n) => {
   let m = -Infinity;
@@ -79,17 +79,17 @@ const lowest = (v, i, n) => {
   return m;
 };
 
-export function trueRange(h, l, c) {
+function trueRange(h, l, c) {
   return h.map((_, i) =>
     i === 0 ? h[i] - l[i] : Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1]))
   );
 }
 
-export const atr = (h, l, c, n = 14) => rma(trueRange(h, l, c), n);
+const atr = (h, l, c, n = 14) => rma(trueRange(h, l, c), n);
 
 const rsiValue = (gain, loss) => (loss === 0 ? (gain === 0 ? 50 : 100) : 100 - 100 / (1 + gain / loss));
 
-export function rsi(close, n = 14) {
+function rsi(close, n = 14) {
   const out = nulls(close.length);
   if (close.length <= n) return out;
   let gain = 0;
@@ -111,7 +111,7 @@ export function rsi(close, n = 14) {
   return out;
 }
 
-export function macd(close, fast = 12, slow = 26, signalN = 9) {
+function macd(close, fast = 12, slow = 26, signalN = 9) {
   const f = ema(close, fast);
   const s = ema(close, slow);
   const line = close.map((_, i) => (f[i] == null || s[i] == null ? null : f[i] - s[i]));
@@ -120,7 +120,7 @@ export function macd(close, fast = 12, slow = 26, signalN = 9) {
   return { line, signal, hist };
 }
 
-export function bollinger(close, n = 20, mult = 2) {
+function bollinger(close, n = 20, mult = 2) {
   const mid = sma(close, n);
   const upper = nulls(close.length);
   const lower = nulls(close.length);
@@ -134,7 +134,7 @@ export function bollinger(close, n = 20, mult = 2) {
   return { upper, middle: mid, lower };
 }
 
-export function keltner(h, l, c, emaN = 20, atrN = 10, mult = 2) {
+function keltner(h, l, c, emaN = 20, atrN = 10, mult = 2) {
   const mid = ema(c, emaN);
   const a = atr(h, l, c, atrN);
   return {
@@ -144,7 +144,7 @@ export function keltner(h, l, c, emaN = 20, atrN = 10, mult = 2) {
   };
 }
 
-export function donchian(h, l, n = 20) {
+function donchian(h, l, n = 20) {
   const upper = nulls(h.length);
   const lower = nulls(h.length);
   const middle = nulls(h.length);
@@ -157,7 +157,7 @@ export function donchian(h, l, n = 20) {
 }
 
 // VWAP direset tiap hari. Saham: hari dihitung dalam WIB (UTC+7), kripto: UTC.
-export function vwap(candles, dayOffsetSec = 0) {
+function vwap(candles, dayOffsetSec = 0) {
   const out = nulls(candles.length);
   let day = null;
   let pv = 0;
@@ -179,7 +179,7 @@ export function vwap(candles, dayOffsetSec = 0) {
 // Parabolic SAR (Wilder). up = titik di bawah harga (tren naik), down = titik di atas harga.
 // Urutan langkah mengikuti ta.sar milik TradingView: saat reversal, SAR baru = ekstrem (termasuk bar
 // yang sedang berjalan), dan penjepitan oleh low/high dua bar sebelumnya dilakukan di akhir.
-export function psar(h, l, c, start = 0.02, inc = 0.02, maxAf = 0.2) {
+function psar(h, l, c, start = 0.02, inc = 0.02, maxAf = 0.2) {
   const n = h.length;
   const up = nulls(n);
   const down = nulls(n);
@@ -242,7 +242,7 @@ export function psar(h, l, c, start = 0.02, inc = 0.02, maxAf = 0.2) {
   return { up, down };
 }
 
-export function supertrend(h, l, c, n = 10, mult = 3) {
+function supertrend(h, l, c, n = 10, mult = 3) {
   const len = h.length;
   const up = nulls(len); // garis hijau (tren naik)
   const down = nulls(len); // garis merah (tren turun)
@@ -269,7 +269,7 @@ export function supertrend(h, l, c, n = 10, mult = 3) {
   return { up, down };
 }
 
-export function stochastic(h, l, c, kN = 14, smoothK = 3, dN = 3) {
+function stochastic(h, l, c, kN = 14, smoothK = 3, dN = 3) {
   const raw = nulls(c.length);
   for (let i = kN - 1; i < c.length; i++) {
     const hh = highest(h, i, kN);
@@ -280,7 +280,7 @@ export function stochastic(h, l, c, kN = 14, smoothK = 3, dN = 3) {
   return { k, d: sma(k, dN) };
 }
 
-export function stochRsi(close, rsiN = 14, stochN = 14, kN = 3, dN = 3) {
+function stochRsi(close, rsiN = 14, stochN = 14, kN = 3, dN = 3) {
   const r = rsi(close, rsiN);
   const raw = onValid(r, (v) => {
     const out = nulls(v.length);
@@ -295,7 +295,7 @@ export function stochRsi(close, rsiN = 14, stochN = 14, kN = 3, dN = 3) {
   return { k, d: sma(k, dN) };
 }
 
-export function cci(h, l, c, n = 20) {
+function cci(h, l, c, n = 20) {
   const tp = c.map((_, i) => (h[i] + l[i] + c[i]) / 3);
   const mean = sma(tp, n);
   const out = nulls(c.length);
@@ -308,7 +308,7 @@ export function cci(h, l, c, n = 20) {
   return out;
 }
 
-export function williamsR(h, l, c, n = 14) {
+function williamsR(h, l, c, n = 14) {
   const out = nulls(c.length);
   for (let i = n - 1; i < c.length; i++) {
     const hh = highest(h, i, n);
@@ -318,7 +318,7 @@ export function williamsR(h, l, c, n = 14) {
   return out;
 }
 
-export function adx(h, l, c, n = 14) {
+function adx(h, l, c, n = 14) {
   const len = c.length;
   const pdi = nulls(len);
   const mdi = nulls(len);
@@ -368,7 +368,7 @@ export function adx(h, l, c, n = 14) {
   return { adx: adxOut, pdi, mdi };
 }
 
-export function obv(c, v) {
+function obv(c, v) {
   const out = nulls(c.length);
   let acc = 0;
   for (let i = 0; i < c.length; i++) {
@@ -378,7 +378,7 @@ export function obv(c, v) {
   return out;
 }
 
-export function mfi(h, l, c, v, n = 14) {
+function mfi(h, l, c, v, n = 14) {
   const out = nulls(c.length);
   const tp = c.map((_, i) => (h[i] + l[i] + c[i]) / 3);
   for (let i = n; i < c.length; i++) {
@@ -394,11 +394,11 @@ export function mfi(h, l, c, v, n = 14) {
   return out;
 }
 
-export function roc(c, n = 12) {
+function roc(c, n = 12) {
   return c.map((v, i) => (i < n || c[i - n] === 0 ? null : ((v - c[i - n]) / c[i - n]) * 100));
 }
 
-export function awesomeOscillator(h, l, fast = 5, slow = 34) {
+function awesomeOscillator(h, l, fast = 5, slow = 34) {
   const mid = h.map((v, i) => (v + l[i]) / 2);
   const f = sma(mid, fast);
   const s = sma(mid, slow);

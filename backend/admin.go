@@ -471,7 +471,7 @@ func (a *App) AdminCache(c echo.Context) error {
 		"instance":                   a.cfg.instanceKey(),
 		"invalidate_on_state":        a.cfg.checkState,
 		"params": map[string]string{
-			"TTL_BASE_SECONDS":        env("TTL_BASE_SECONDS", env("STATIC_TTL_SECONDS", "3600")),
+			"TTL_BASE_SECONDS":        env("TTL_BASE_SECONDS", "3600"),
 			"DYNAMIC_TTL_K":           env("DYNAMIC_TTL_K", "1"),
 			"DYNAMIC_TTL_MIN_SECONDS": env("DYNAMIC_TTL_MIN_SECONDS", "300"),
 			"DYNAMIC_TTL_MAX_SECONDS": env("DYNAMIC_TTL_MAX_SECONDS", "3600"),

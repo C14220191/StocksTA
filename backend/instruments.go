@@ -31,7 +31,6 @@ import (
 var (
 	reStockCode = regexp.MustCompile(`^[A-Z0-9]{2,8}$`)
 	reUSDTPair  = regexp.MustCompile(`^[A-Z0-9]{1,20}USDT$`)
-	assetSource = map[string]string{"stock": "yahoo", "crypto": "binance", "commodity": "binance_futures"}
 )
 
 // lookupError membawa status HTTP untuk respons admin: 400 input salah, 404 tidak terdaftar di

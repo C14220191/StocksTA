@@ -44,7 +44,7 @@ function analysisOrigin(fresh) {
 
 const modelLabel = (m) => (!m || m === "(default hermes)" ? "model default Hermes" : m);
 
-export function AiDisclaimer({ model, withFundamentals }) {
+function AiDisclaimer({ model, withFundamentals }) {
   return (
     <div role="note" className="mt-3 rounded-lg border border-hold/40 bg-hold/10 px-4 py-3 font-sans text-xs leading-relaxed">
       <strong className="text-ink">Dibuat oleh AI, bukan ajakan berinvestasi.</strong>{" "}

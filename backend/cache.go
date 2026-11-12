@@ -135,7 +135,7 @@ func NewPolicy(ctx context.Context, cfg policyConfig, store *Store) (CachePolicy
 		return NoCache{}, nil
 	}
 
-	base, err := envSeconds("TTL_BASE_SECONDS", envInt("STATIC_TTL_SECONDS", 3600))
+	base, err := envSeconds("TTL_BASE_SECONDS", 3600)
 	if err != nil {
 		return nil, err
 	}

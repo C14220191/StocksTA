@@ -5,7 +5,7 @@ import { clearAdminSession, getAdminToken } from "./adminAuth.js";
 const BASE = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
 const LOGIN_PATH = "/api/admin/login";
 
-export class ApiError extends Error {
+class ApiError extends Error {
   constructor(status, message) {
     super(message);
     this.name = "ApiError";
