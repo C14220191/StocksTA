@@ -181,10 +181,10 @@ lab_start() {
     import_env "$ROOT/.env"
     import_env "$RUN_ENV"
     export AI_MODE="${1:-stub}"
-    # Key Redis lab terpisah dari backend utama (lab.hybrid-2-pg vs hybrid-2-pg, cache.go instanceKey):
+    # Key Redis lab terpisah dari backend utama (lab.hybrid-2-pg vs hybrid-2-pg, services/cache.go InstanceKey):
     # tanpa ini cache dan popularitas pre-generation kondisi yang sama tercampur.
     export CACHE_NAMESPACE=lab
-    # k6 memanggil /api/analyze lab tanpa akun; backend utama tetap wajib login (auth.go registerDataRoutes)
+    # k6 memanggil /api/analyze lab tanpa akun; backend utama tetap wajib login (controllers/routes.go registerDataRoutes)
     export REQUIRE_LOGIN=off
     if [[ "$AI_MODE" == "http" && "$(health http://127.0.0.1:8000/health)" == "DOWN" ]]; then
         start_api
