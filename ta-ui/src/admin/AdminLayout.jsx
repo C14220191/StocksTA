@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link, Navigate, NavLink, Outlet, useLocation } from "react-router-dom";
-import { getAdminSession } from "../lib/api.js";
-import { ADMIN_SESSION_EVENT, clearAdminSession, getAdminExpiry, getAdminToken } from "../lib/adminAuth.js";
+import { getMe, signOut } from "../lib/api.js";
+import { getToken, updateSessionUser } from "../lib/auth.js";
+import useAuth from "../lib/useAuth.js";
 import { fmtDateTime } from "./ui.jsx";
 
 const NAV = [
@@ -11,52 +12,65 @@ const NAV = [
   { to: "/admin/instruments", label: "Instrumen" },
   { to: "/admin/evaluation", label: "Evaluasi" },
   { to: "/admin/health", label: "API Health" },
+  { to: "/admin/users", label: "Pengguna" },
 ];
 
-// Status sesi: checking (token ada, sedang dicek ke backend) | in | out. Token yang ditolak backend
-// (401: kedaluwarsa, kata sandi diganti) dihapus oleh lib/api.js dan memicu ADMIN_SESSION_EVENT.
-function useAdminSession() {
-  const [state, setState] = useState(() => ({ status: getAdminToken() ? "checking" : "out", reason: null }));
-
+// Sebelum menampilkan halaman admin, profil dicek ulang ke backend (peran bisa sudah diubah, sesi
+// bisa sudah dicabut). 401 menghapus sesi (lib/api.js) sehingga user = null dan diarahkan ke login.
+function useFreshProfile() {
+  const [checked, setChecked] = useState(() => !getToken());
   useEffect(() => {
-    if (!getAdminToken()) return;
+    if (!getToken()) return undefined;
     const ctrl = new AbortController();
-    getAdminSession(ctrl.signal)
-      .then(() => setState({ status: "in", reason: null }))
+    getMe(ctrl.signal)
+      .then((r) => {
+        updateSessionUser(r.user);
+        setChecked(true);
+      })
       .catch((e) => {
-        if (e.name === "AbortError") return;
-        // 401/503 = tidak boleh masuk; backend tidak terjangkau = tampilkan halaman, error muncul di sana
-        setState(e.status === 401 || e.status === 503 ? { status: "out", reason: "expired" } : { status: "in", reason: null });
+        if (e.name !== "AbortError") setChecked(true); // backend tidak terjangkau: halaman menampilkan errornya
       });
     return () => ctrl.abort();
   }, []);
-
-  useEffect(() => {
-    const onChange = (e) => {
-      if (e.detail === "login") setState({ status: "in", reason: null });
-      else setState({ status: "out", reason: e.detail });
-    };
-    window.addEventListener(ADMIN_SESSION_EVENT, onChange);
-    return () => window.removeEventListener(ADMIN_SESSION_EVENT, onChange);
-  }, []);
-
-  return state;
+  return checked;
 }
 
-// Layout admin: sidebar di layar lebar, menu horizontal di layar sempit. Semua halaman admin
-// hanya tampil setelah login (LoginPage).
+function Forbidden({ user }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4 font-sans">
+      <div className="w-full max-w-sm rounded-xl border border-line bg-panel p-6">
+        <h1 className="text-lg font-bold tracking-tight">Khusus admin</h1>
+        <p className="mt-2 text-sm text-muted">
+          Akun <span className="text-ink">{user.email}</span> berperan user. Halaman admin hanya untuk akun berperan admin.
+        </p>
+        <div className="mt-5 flex gap-3">
+          <Link to="/" className="rounded-lg bg-panel-2 px-4 py-2 text-xs font-semibold hover:text-hold">
+            Ke beranda
+          </Link>
+          <button onClick={signOut} className="rounded-lg border border-line px-4 py-2 text-xs font-semibold text-muted hover:text-ink">
+            Masuk dengan akun lain
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Layout admin: sidebar di layar lebar, menu horizontal di layar sempit. Semua halaman admin hanya
+// tampil untuk akun ber-role admin.
 export default function AdminLayout() {
   const location = useLocation();
-  const session = useAdminSession();
+  const { user, expiresAt, reason } = useAuth();
+  const checked = useFreshProfile();
 
-  if (session.status === "out") {
+  if (!user) {
     const next = encodeURIComponent(location.pathname + location.search);
-    const reason = session.reason === "expired" ? "&reason=expired" : "";
-    return <Navigate to={`/admin/login?next=${next}${reason}`} replace />;
+    return <Navigate to={`/login?next=${next}${reason === "expired" ? "&reason=expired" : ""}`} replace />;
   }
-  if (session.status === "checking") {
-    return <p className="px-6 py-10 font-sans text-sm text-muted">Memeriksa sesi admin...</p>;
+  if (!checked) {
+    return <p className="px-6 py-10 font-sans text-sm text-muted">Memeriksa sesi...</p>;
   }
+  if (user.role !== "admin") return <Forbidden user={user} />;
 
   return (
     <div className="min-h-screen font-sans md:flex">
@@ -85,9 +99,14 @@ export default function AdminLayout() {
           <Link to="/" className="hidden text-xs text-muted hover:text-ink md:block">
             ← Ke aplikasi pengguna
           </Link>
-          <p className="text-xs text-muted md:mt-4">Sesi sampai {fmtDateTime(getAdminExpiry())}</p>
+          <div className="min-w-0 md:mt-4">
+            <Link to="/account" className="block truncate text-xs font-semibold text-ink hover:text-hold" title={user.email}>
+              {user.name}
+            </Link>
+            <p className="text-xs text-muted">Sesi sampai {fmtDateTime(expiresAt)}</p>
+          </div>
           <button
-            onClick={() => clearAdminSession("logout")}
+            onClick={signOut}
             className="rounded-lg border border-line px-3 py-1.5 text-xs font-semibold text-muted transition-colors hover:text-ink md:mt-2"
           >
             Keluar

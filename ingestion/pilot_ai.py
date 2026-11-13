@@ -36,6 +36,19 @@ FIELDS = ["run", "symbol", "asset_type", "method", "ok", "format_ok", "json_repa
 HEADERS = {"X-TA-Trigger": "pilot"}
 
 
+def login(url):
+    """Endpoint data dan analisis wajib login: masuk dengan akun admin bawaan (ADMIN_EMAIL + ADMIN_PASSWORD
+    dari .env/run.env, dimuat ta-up pilot-ai) dan pakai token sesinya di setiap request."""
+    email = os.environ.get("ADMIN_EMAIL", "admin@example.com")
+    password = os.environ.get("ADMIN_PASSWORD")
+    if not password:
+        sys.exit("ADMIN_PASSWORD belum di-set (.env): pilot perlu login karena /api/analyze wajib login")
+    r = requests.post(f"{url}/api/auth/login", json={"email": email, "password": password}, timeout=15)
+    if r.status_code != 200:
+        sys.exit(f"Login pilot sebagai {email} gagal: HTTP {r.status_code} {r.text[:200]}")
+    HEADERS["Authorization"] = f"Bearer {r.json()['token']}"
+
+
 def summary(values):
     v = sorted(x for x in values if x is not None)
     if not v:
@@ -183,10 +196,12 @@ def main():
         sys.exit(f"Backend harus CACHE_MODE=no_cache untuk pilot (sekarang {health.get('cache_mode')}). "
                  "Jalankan: ./ta-up.sh restart no_cache http   (Windows: .\\ta-up.ps1 restart no_cache http)")
 
+    login(args.url)
     if args.symbols:
         symbols = [(s, asset_type(args.url, s)) for s in (x.strip().upper() for x in args.symbols.split(",")) if s]
     else:
-        ov = requests.get(f"{args.url}/api/market/overview", params={"limit": 50, "movers": 1}, timeout=10).json()
+        ov = requests.get(f"{args.url}/api/market/overview", params={"limit": 50, "movers": 1},
+                          headers=HEADERS, timeout=10).json()
         symbols = [(r["symbol"], r["asset_type"]) for r in ov["top_volume"]]
 
     out = writer = None
@@ -204,6 +219,11 @@ def main():
                 try:
                     r = requests.get(f"{args.url}/api/analyze/{sym}", params={"method": method},
                                      headers=HEADERS, timeout=400)
+                    if r.status_code == 401:  # sesi habis di tengah pilot panjang: login ulang, ulangi sekali
+                        login(args.url)
+                        t0 = time.monotonic()
+                        r = requests.get(f"{args.url}/api/analyze/{sym}", params={"method": method},
+                                         headers=HEADERS, timeout=400)
                     d = r.json()
                     ok = r.status_code == 200
                 except Exception as e:  # catat dan lanjut

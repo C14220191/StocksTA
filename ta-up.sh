@@ -184,6 +184,8 @@ lab_start() {
     # Key Redis lab terpisah dari backend utama (lab.hybrid-2-pg vs hybrid-2-pg, cache.go instanceKey):
     # tanpa ini cache dan popularitas pre-generation kondisi yang sama tercampur.
     export CACHE_NAMESPACE=lab
+    # k6 memanggil /api/analyze lab tanpa akun; backend utama tetap wajib login (auth.go registerDataRoutes)
+    export REQUIRE_LOGIN=off
     if [[ "$AI_MODE" == "http" && "$(health http://127.0.0.1:8000/health)" == "DOWN" ]]; then
         start_api
     fi
@@ -655,6 +657,9 @@ case "$ACTION" in
         if ! flock -n "$LOG_DIR/pilot_ai.lock" true; then
             die "Pilot lain masih berjalan (ps aux | grep [p]ilot_ai). Tunggu selesai atau: pkill -f pilot_ai.py"
         fi
+        # .env + run.env: pilot login ke backend utama dengan ADMIN_EMAIL + ADMIN_PASSWORD
+        import_env "$ROOT/.env"
+        import_env "$RUN_ENV"
         pilot_args=(--n "${ARG1:-10}" --csv "$LOG_DIR/pilot_ai.csv")
         if [[ -n "$ARG2" ]]; then
             pilot_args+=(--symbols "$ARG2")

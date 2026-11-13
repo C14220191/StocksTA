@@ -32,7 +32,7 @@ type App struct {
 	rdb    *redis.Client // popularitas + API Health admin (ada juga saat no_cache); nil kalau Redis mati
 	pregen *PregenConfig // nil kalau PREGEN=off
 	flight singleflight.Group
-	auth   *adminAuth    // login halaman admin
+	auth   *authService  // akun pengguna, sesi, login Google (auth.go)
 	ingest *ingestRunner // backfill instrumen yang ditambahkan lewat admin
 }
 

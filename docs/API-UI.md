@@ -1,6 +1,10 @@
 # API untuk UI (Home, Search, Detail)
 
-Base URL: `http://127.0.0.1:8080`. Semua endpoint `GET`, JSON.
+Base URL: `http://127.0.0.1:8080`. Semua endpoint `GET`, JSON, dan **wajib login**: header
+`Authorization: Bearer <token>` dari `POST /api/auth/login` (lihat Akun pengguna); tanpa sesi `401`.
+Instans lab benchmark (`ta-up lab` / `bench`, port 8101–8115) berjalan dengan `REQUIRE_LOGIN=off`, jadi k6
+memanggilnya tanpa akun seperti pada run benchmark yang sudah diukur. Pilot AI (`ta-up pilot-ai`) login
+ke backend utama dengan `ADMIN_EMAIL` + `ADMIN_PASSWORD`.
 
 | Halaman | Endpoint | Memanggil AI? | Dicatat di `inference_log`? |
 |---|---|---|---|
@@ -169,22 +173,123 @@ Header opsional `X-TA-Trigger: ui | k6 | manual | pilot` (default `ui`) menandai
 
 Origin yang diizinkan diatur `CORS_ORIGINS` di `run.env` (default `http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000`).
 
+## Akun pengguna (`/login`, `/register`, `/account` di UI)
+
+Peran `user` (default saat daftar) dan `admin`. Semua halaman wajib login: Home, Search, Detail, dan Akun
+untuk semua peran, halaman admin hanya untuk `admin`; yang terbuka hanya halaman login / daftar / lupa dan
+reset kata sandi / verifikasi email. Backend utama menolak data dan analisis tanpa sesi (`REQUIRE_LOGIN`,
+default `on`; `off` hanya untuk instans lab benchmark). Tabel: `migrations/011_users.sql`. Kalau migrasi
+belum dijalankan, endpoint data, akun, dan admin menjawab `503 {"code":"not_ready"}` dengan petunjuk.
+
+**Sesi.** Login mengembalikan `{"token", "expires_at", "user"}`. Endpoint data dan analisis, akun sendiri,
+dan `/api/admin/*` wajib header `Authorization: Bearer <token>`: tanpa token atau sesi tidak sah `401`,
+bukan admin `403`.
+Token acak 256 bit, berlaku `SESSION_HOURS` (default 24); database hanya menyimpan sha256-nya, jadi sesi
+bisa dicabut (logout, ganti / reset kata sandi, akun dinonaktifkan). Peran dibaca dari database setiap
+request, jadi perubahan peran oleh admin langsung berlaku.
+
+**Akun bawaan** (dibuat atau disamakan setiap backend start; kata sandinya tidak bisa diganti dari UI):
+
+| Akun | Email (`run.env`) | Kata sandi |
+|---|---|---|
+| Admin | `ADMIN_EMAIL` (default `admin@example.com`) | `ADMIN_PASSWORD` di `.env` (rahasia). Kosong = admin bawaan tidak dibuat |
+| User demo | `DEMO_USER_EMAIL` (default `user@example.com`) | `DEMO_USER_PASSWORD` di `.env`. Kosong = user demo tidak dibuat. Di server publik pakai kata sandi yang tidak tercantum di repo |
+
+**Validasi.** Kesalahan isian dikembalikan sekaligus per isian: `422 {"error", "fields": {"name"?, "email"?,
+"password"?, "password_confirm"?, "current_password"?, "role"?}}`. Email: tepat satu `@`, bagian lokal
+maksimal 64 karakter tanpa spasi / karakter non-ASCII / titik di awal, akhir, atau berurutan; domain lengkap
+(`nama@gmail` ditolak) dengan akhiran huruf; lalu (kalau `EMAIL_CHECK_DNS=on`) domainnya harus ada di DNS
+dan menerima email (punya MX atau A, dan bukan null MX: `example.com` ditolak). Email disimpan huruf kecil.
+Kata sandi: 8 karakter sampai 72 byte, berisi huruf dan angka, tidak sama dengan email. Nama: 2–80 karakter.
+
+**Verifikasi email dan reset kata sandi.** Link di email berisi token sekali pakai (verifikasi 24 jam, reset
+1 jam; membuat link baru membatalkan yang lama) dan menuju halaman UI (`APP_URL/verify-email?token=`,
+`APP_URL/reset-password?token=`), yang meneruskannya ke API. Dengan `REQUIRE_EMAIL_VERIFICATION=on`, akun
+baru tidak bisa login sebelum verifikasi. Email dikirim lewat SMTP (`.env`: `SMTP_HOST`, `SMTP_PORT` default
+587 dengan STARTTLS wajib, atau 465 untuk TLS langsung; `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, mis.
+`StocksTA <akun@gmail.com>`). Gmail: `smtp.gmail.com`, port 587, kata sandi = App Password (butuh verifikasi
+2 langkah). Tanpa `SMTP_HOST`, email tidak dikirim dan isinya (termasuk link) dicetak ke log backend
+(`logs/backend.err.log`, baris `EMAIL`) supaya alurnya tetap bisa dicoba di lokal.
+
+**Login Google (OAuth 2.0 + OpenID Connect).** Aktif kalau `.env` berisi `GOOGLE_CLIENT_ID` dan
+`GOOGLE_CLIENT_SECRET` (Google Cloud Console → APIs & Services → Credentials → OAuth client ID → Web
+application). `GOOGLE_REDIRECT_URL` (default `http://localhost:$PORT/api/auth/google/callback`) harus
+didaftarkan persis sama di "Authorized redirect URIs": lokal `http://localhost:8080/api/auth/google/callback`,
+produksi `https://ubuntu-standard-pc-q35-ich9-2009.tail416a7f.ts.net/api/auth/google/callback` (isi
+`GOOGLE_REDIRECT_URL` itu di `.env` server; lihat Deployment). Alur: UI membuka `GET /api/auth/google/start?next=` (navigasi penuh) → Google →
+`GET /api/auth/google/callback` → backend redirect ke `APP_URL/auth/google?code=<kode sekali pakai, 2 menit>`
+→ UI menukarnya lewat `POST /api/auth/google/exchange`, jadi token sesi tidak pernah ada di URL.
+Verifikasi: state terikat cookie browser yang memulai login (10 menit, sekali pakai), PKCE S256, tanda
+tangan RS256 ID token dengan kunci publik Google (JWKS), `iss`, `aud` = client ID, `exp`, `iat`, `nonce`,
+dan `email_verified` harus true. Akun dicari berdasarkan `sub` Google, lalu email: akun lokal dengan email
+yang sama ditautkan (kalau email akun lokal itu belum pernah diverifikasi, kata sandinya dihapus, karena
+bisa saja didaftarkan orang lain), selain itu dibuat akun baru (role `user`, tanpa kata sandi; kata sandi
+bisa dibuat di `/account`). Gagal → redirect ke `/login?error=` `google_cancelled`, `google_state`,
+`google_failed`, `google_unverified`, `google_conflict`, `google_disabled`, atau `account_disabled`.
+
+**Pembatasan.** Login gagal: 10 kali per email per 15 menit (`429`). Endpoint yang memakai bcrypt atau
+mengirim email: `AUTH_RATE_LIMIT_RPS` (default 1/detik, burst 10) per IP. Kirim ulang verifikasi: jeda 60
+detik per akun (`429 {"code":"cooldown","retry_after"}`). Login dengan email tak terdaftar dan login
+dengan kata sandi salah dijawab sama (`401 invalid_credentials`); lupa kata sandi dan kirim ulang
+verifikasi selalu menjawab sama untuk email terdaftar maupun tidak. Daftar dengan email yang sudah ada
+tetap memberi tahu (`409 email_taken`), karena pengguna perlu tahu harus masuk atau reset.
+
+| Endpoint | Body → respons |
+|---|---|
+| `GET /api/auth/config` | `{"app_name", "ready", "google", "email_verification", "mail": "smtp"\|"log"}` |
+| `POST /api/auth/register` | `{"name", "email", "password", "password_confirm"}` → `201 {"user", "verification_required", "mail"}` (+ sesi kalau verifikasi tidak diwajibkan); `422` isian, `409 email_taken` |
+| `POST /api/auth/login` | `{"email", "password"}` → sesi; `401 invalid_credentials`, `403 email_unverified` / `account_disabled`, `429 too_many_attempts` |
+| `POST /api/auth/verify-email` | `{"token"}` → `{"verified", "email"}`; `400 token_invalid`, `409 token_used`, `410 token_expired` |
+| `POST /api/auth/resend-verification` | `{"email"}` → `{"message", "mail"}`; `429 cooldown` |
+| `POST /api/auth/forgot-password` | `{"email"}` → `{"message", "mail"}` (selalu sama) |
+| `POST /api/auth/reset-password/check` | `{"token"}` → `{"valid", "email"}` tanpa memakai token; error token seperti verify |
+| `POST /api/auth/reset-password` | `{"token", "password", "password_confirm"}` → `{"message", "email"}`; semua sesi dicabut |
+| `GET /api/auth/google/start?next=`, `GET /api/auth/google/callback` | navigasi browser (redirect) |
+| `POST /api/auth/google/exchange` | `{"code"}` → sesi + `"next"`; `400 google_code` |
+| `GET /api/auth/me`, `PATCH /api/auth/me` | `{"user", "expires_at"}`; `{"name"}` → `{"user"}` |
+| `POST /api/auth/password` | `{"current_password", "password", "password_confirm"}` → `{"user", "message"}`; sesi lain dicabut; akun Google tanpa kata sandi tidak perlu `current_password`; akun bawaan `403 managed_account` |
+| `POST /api/auth/logout`, `POST /api/auth/logout-all` | cabut sesi ini; cabut semua sesi akun |
+
+`user` = `{"id", "email", "name", "role", "email_verified", "has_password", "google_linked", "disabled",
+"created_at", "last_login_at", "managed"}` (`managed` = akun bawaan).
+
 ## Admin (`/admin` di UI)
 
-**Autentikasi.** Semua `/api/admin/*` selain login wajib header `Authorization: Bearer <token>`
-(tanpa token / token tidak sah atau kedaluwarsa: `401`). Kata sandi admin = `ADMIN_PASSWORD` di `.env`
-(rahasia, tidak di-commit); kalau kosong, admin ditutup (`503`). Token ditandatangani HMAC-SHA256
-dengan kunci turunan kata sandi, berlaku `ADMIN_SESSION_HOURS` (default 12) dan tetap sah setelah
-backend restart; mengganti kata sandi membatalkan semua token. Login gagal dibatasi 10 kali per 10 menit
-(global, `429`). UI menyimpan token di `localStorage` dan kembali ke `/admin/login` saat menerima `401`.
+Wajib login dengan akun ber-role `admin` (lihat Akun pengguna). UI menyimpan sesi di `localStorage`;
+`401` menghapusnya dan kembali ke `/login`, `403` menampilkan "Khusus admin".
 
 | Endpoint | Isi |
 |---|---|
-| `POST /api/admin/login` `{"password"}` | `{"token", "expires_at"}` atau `401 Kata sandi salah.` |
-| `GET /api/admin/session` | `{"expires_at"}`: cek token tersimpan masih berlaku |
+| `GET /api/admin/users?q=&role=admin\|user&limit=50&offset=0` | `{"users", "total", "limit", "offset"}`, cari nama / email |
+| `POST /api/admin/users` `{"name", "email", "password", "role"}` | Validasi sama dengan daftar; akun langsung terverifikasi. `201 {"user"}`, `409 email_taken` |
+| `PATCH /api/admin/users/:id` `{"name"?, "role"?, "disabled"?, "email_verified": true?}` | `{"user"}`. Menonaktifkan mencabut semua sesinya. `409 self` (menurunkan / menonaktifkan / menghapus akun sendiri), `409 managed_account` (admin bawaan) |
+| `POST /api/admin/users/:id/password-reset` | Kirim link reset ke email akun; `409` untuk akun bawaan / nonaktif |
+| `DELETE /api/admin/users/:id` | Hapus akun beserta sesi dan tokennya; penjaga sama dengan PATCH |
 
-Backend tetap listen di `127.0.0.1`; dari luar server pakai SSH tunnel (`npm run dev:server`, lihat
-`ta-ui/.env.server`). Kalau suatu saat dibuka ke jaringan, wajib lewat HTTPS (token dikirim di header).
+**Deployment.** Backend tetap listen di `127.0.0.1:8080`. Dari internet, ia dibuka lewat Tailscale Funnel
+(HTTPS, reverse proxy lokal) di `https://ubuntu-standard-pc-q35-ich9-2009.tail416a7f.ts.net`. UI produksi ada
+di Vercel `https://stocks-ta.vercel.app` (env Vercel `VITE_API_URL` = alamat Funnel, berlaku saat build:
+redeploy setelah diganti). Untuk pengembangan, SSH tunnel juga tetap bisa dipakai (`npm run dev:server`, lihat
+`ta-ui/.env.server`). Funnel hanya boleh mengarah ke port 8080, **jangan** ke instans lab 8101–8115, yang
+berjalan tanpa login (`REQUIRE_LOGIN=off`). `.env` server untuk produksi:
+
+```
+APP_URL=https://stocks-ta.vercel.app
+GOOGLE_REDIRECT_URL=https://ubuntu-standard-pc-q35-ich9-2009.tail416a7f.ts.net/api/auth/google/callback
+GOOGLE_CLIENT_ID=<client id>.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=<client secret>
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=<akun>@gmail.com
+SMTP_PASSWORD=<App Password Gmail>
+SMTP_FROM=StocksTA <<akun>@gmail.com>
+ADMIN_PASSWORD=<kata sandi admin yang kuat>
+DEMO_USER_PASSWORD=<kata sandi demo, jangan demo12345>
+```
+
+Origin Vercel sudah ada di `CORS_ORIGINS` (`run.env`). Rate limit per IP membaca IP klien dari
+`X-Forwarded-For` paling kanan yang ditambahkan proxy lokal tepercaya (`echo.ExtractIPFromXFFHeader`), jadi
+tidak bisa dihindari dengan header palsu.
 
 | Halaman | Endpoint | Isi |
 |---|---|---|

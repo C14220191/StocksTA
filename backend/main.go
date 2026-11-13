@@ -23,6 +23,13 @@ func env(key, def string) string {
 	return def
 }
 
+func envFloat(key string, def float64) float64 {
+	if v, err := strconv.ParseFloat(env(key, ""), 64); err == nil {
+		return v
+	}
+	return def
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -60,12 +67,10 @@ func main() {
 		cfg:    cfg,
 		ai:     ai,
 		rdb:    newAdminRedis(),
-		auth:   newAdminAuth(),
+		auth:   newAuthService(),
 		ingest: newIngestRunner(store),
 	}
-	if !app.auth.enabled() {
-		slog.Warn("ADMIN_PASSWORD kosong: halaman dan endpoint admin ditutup (isi di .env)")
-	}
+	app.initAuth(ctx) // akun (migrasi 011) + akun bawaan admin / demo user, lihat auth.go
 
 	// Watcher: event-driven invalidation proaktif untuk kondisi yang memakai θ (event_only, hybrid).
 	var watcher *Watcher
@@ -101,13 +106,17 @@ func main() {
 
 	e := echo.New()
 	e.HideBanner = true
+	// IP klien untuk rate limit dan log: di belakang reverse proxy lokal (Tailscale Funnel, nginx) ambil IP
+	// paling kanan di X-Forwarded-For yang bukan proxy tepercaya (loopback / jaringan privat). Default Echo
+	// memakai IP paling kiri, yang bisa diisi klien sendiri untuk menghindari pembatas per IP.
+	e.IPExtractor = echo.ExtractIPFromXFFHeader()
 	e.Use(middleware.Recover())
-	// CORS untuk dev server React (Vite :5173 / CRA :3000). POST hanya untuk aksi admin; header
-	// Authorization (token admin) dan Content-Type (body JSON) membuat browser mengirim preflight,
-	// yang di-cache MaxAge detik supaya halaman admin yang polling tidak menggandakan request.
+	// CORS untuk dev server React (Vite :5173 / CRA :3000). POST/PATCH/DELETE hanya untuk akun dan aksi
+	// admin; header Authorization (token sesi) dan Content-Type (body JSON) membuat browser mengirim
+	// preflight, yang di-cache MaxAge detik supaya halaman admin yang polling tidak menggandakan request.
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins: strings.Split(env("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"), ","),
-		AllowMethods: []string{http.MethodGet, http.MethodPost},
+		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete},
 		AllowHeaders: []string{echo.HeaderAuthorization, echo.HeaderContentType, "X-TA-Trigger"},
 		MaxAge:       600,
 	}))
@@ -128,21 +137,20 @@ func main() {
 		}))
 	}
 	e.GET("/health", app.Health)
+	app.registerDataRoutes(e, env("REQUIRE_LOGIN", "on") != "off")
 
-	// AI inference (melewati cache policy dan dicatat ke inference_log = data eksperimen)
-	e.GET("/api/analyze/:symbol", app.Analyze)
-
-	// Data UI (hanya baca database, tanpa AI dan tanpa inference_log)
-	e.GET("/api/market/overview", app.MarketOverview)
-	e.GET("/api/search", app.Search)
-	e.GET("/api/instruments/:symbol", app.InstrumentDetail)
-	e.GET("/api/instruments/:symbol/candles", app.InstrumentCandles)
-
-	// Admin (UI /admin). Login dengan ADMIN_PASSWORD (.env) -> token; semua endpoint lain di bawah
-	// /api/admin wajib "Authorization: Bearer <token>" (auth.go).
-	e.POST("/api/admin/login", app.AdminLogin)
-	adm := e.Group("/api/admin", app.requireAdmin)
-	adm.GET("/session", app.AdminSession)
+	// Akun pengguna (auth.go, google.go). Login -> token sesi; endpoint akun sendiri dan /api/admin/*
+	// wajib "Authorization: Bearer <token>", /api/admin/* juga wajib role admin. Endpoint yang memakai
+	// bcrypt atau mengirim email dibatasi lebih ketat per IP (authLimit).
+	authLimit := middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
+		Store: middleware.NewRateLimiterMemoryStoreWithConfig(middleware.RateLimiterMemoryStoreConfig{
+			Rate: rate.Limit(envFloat("AUTH_RATE_LIMIT_RPS", 1)), Burst: 10, ExpiresIn: 10 * time.Minute,
+		}),
+		DenyHandler: func(c echo.Context, _ string, _ error) error {
+			return jsonError(c, http.StatusTooManyRequests, "rate_limited", "Terlalu banyak percobaan, tunggu sebentar lalu coba lagi.")
+		},
+	})
+	adm := app.registerAuthRoutes(e, authLimit)
 	adm.GET("/overview", app.AdminOverview)
 	adm.GET("/cache", app.AdminCache)
 	adm.POST("/cache/:symbol/invalidate", app.AdminInvalidate)

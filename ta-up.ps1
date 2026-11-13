@@ -214,6 +214,9 @@ switch ($Action) {
     "pilot-ai" {
         # .\ta-up.ps1 pilot-ai [N] [SIMBOL,SIMBOL,...]  (default: semua instrument x 3 metode)
         $n = if ($CacheMode) { $CacheMode } else { "10" }
+        # .env + run.env: pilot login ke backend utama dengan ADMIN_EMAIL + ADMIN_PASSWORD
+        Import-EnvFile (Join-Path $Root ".env")
+        Import-EnvFile $RunEnv
         $pyArgs = @("--n", $n, "--csv", (Join-Path $LogDir "pilot_ai.csv"))
         if ($AiMode) { $pyArgs += @("--symbols", $AiMode) }
         Invoke-Py "pilot_ai.py" $pyArgs
@@ -234,6 +237,8 @@ switch ($Action) {
                 $env:AI_MODE = if ($AiMode) { $AiMode } else { "stub" }
                 # key Redis lab terpisah dari backend utama (lab.hybrid-2-pg vs hybrid-2-pg)
                 $env:CACHE_NAMESPACE = "lab"
+                # k6 memanggil /api/analyze lab tanpa akun; backend utama tetap wajib login
+                $env:REQUIRE_LOGIN = "off"
                 if ((Get-Health "http://127.0.0.1:8000/health") -eq "DOWN" -and $env:AI_MODE -eq "http") { Start-Api }
                 foreach ($c in $LabMatrix) {
                     $env:PORT = "$($c.Port)"
