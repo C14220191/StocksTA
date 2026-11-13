@@ -1,0 +1,365 @@
+package services
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"ta-backend/models"
+)
+
+// Tambah instrumen dari halaman admin (Admin -> Instrumen). Simbol selalu dicek ke sumber datanya
+// sebelum disimpan, karena ingestion, price feed, dan tampilan bergantung pada sumber yang benar:
+//
+//	stock     -> Yahoo Finance, wajib saham Bursa Efek Indonesia (.JK, IDR)
+//	crypto    -> Binance spot, pasangan USDT berstatus TRADING
+//	commodity -> Binance USDⓈ-M futures, underlyingType COMMODITY (TradFi perpetual, mis. XAUUSDT)
+//
+// Setelah disimpan, backfill candle 1h + 1d (dan fundamental untuk saham) dijalankan di background
+// lewat skrip ingestion Python yang sama dengan cron (lihat ingest_runner.go).
+
+var (
+	reStockCode = regexp.MustCompile(`^[A-Z0-9]{2,8}$`)
+	reUSDTPair  = regexp.MustCompile(`^[A-Z0-9]{1,20}USDT$`)
+)
+
+// Kesalahan lookup untuk respons admin: 400 input salah, 404 tidak terdaftar di sumber, 502 sumber
+// tidak bisa dihubungi.
+func badInput(format string, a ...any) error {
+	return newError(http.StatusBadRequest, "", fmt.Sprintf(format, a...))
+}
+
+func notListed(format string, a ...any) error {
+	return newError(http.StatusNotFound, "", fmt.Sprintf(format, a...))
+}
+
+func unreachable(source string, err error) error {
+	return newError(http.StatusBadGateway, "", fmt.Sprintf("%s tidak bisa dihubungi: %v", source, err))
+}
+
+// normalizeSymbol: "bbca" -> BBCA.JK, "sol" / "SOL/USDT" -> SOLUSDT.
+func normalizeSymbol(assetType, raw string) (string, error) {
+	s := strings.NewReplacer(" ", "", "/", "", "-", "", "_", "").Replace(strings.ToUpper(strings.TrimSpace(raw)))
+	switch assetType {
+	case "stock":
+		code := strings.TrimSuffix(s, ".JK")
+		if !reStockCode.MatchString(code) {
+			return "", badInput("Kode saham IDX tidak valid: %q. Contoh: BBCA atau BBCA.JK.", raw)
+		}
+		return code + ".JK", nil
+	case "crypto", "commodity":
+		if !strings.HasSuffix(s, "USDT") {
+			s += "USDT"
+		}
+		if !reUSDTPair.MatchString(s) {
+			return "", badInput("Simbol tidak valid: %q. Contoh: SOL, SOLUSDT, atau SOL/USDT.", raw)
+		}
+		return s, nil
+	}
+	return "", badInput("asset_type harus stock, crypto, atau commodity")
+}
+
+var lookupClient = &http.Client{Timeout: 25 * time.Second}
+
+// getJSON: GET dan decode JSON. Status HTTP dikembalikan supaya pemanggil bisa membedakan
+// "simbol tidak ada" dari "sumber bermasalah".
+func getJSON(ctx context.Context, u string, out any) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; StocksTA)") // Yahoo menolak klien tanpa User-Agent
+	resp, err := lookupClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // exchangeInfo futures ~ beberapa MB
+	if err != nil {
+		return resp.StatusCode, err
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return resp.StatusCode, fmt.Errorf("respons bukan JSON (HTTP %d)", resp.StatusCode)
+	}
+	return resp.StatusCode, nil
+}
+
+// binanceBase: ".../api/v3/" dari URL klines yang sama dengan ingestion dan price feed.
+func binanceBase(envKey, def string) string {
+	return strings.TrimSuffix(strings.TrimRight(env(envKey, def), "/"), "klines")
+}
+
+func binancePrice(ctx context.Context, base, symbol string) *float64 {
+	var t struct {
+		Price string `json:"price"`
+	}
+	if _, err := getJSON(ctx, base+"ticker/price?symbol="+url.QueryEscape(symbol), &t); err != nil {
+		return nil
+	}
+	p, err := strconv.ParseFloat(t.Price, 64)
+	if err != nil || p <= 0 {
+		return nil
+	}
+	return &p
+}
+
+// cleanStockName: "PT Bank Central Asia Tbk" -> "Bank Central Asia".
+func cleanStockName(n string) string {
+	n = strings.TrimSpace(strings.ReplaceAll(n, " (Persero)", ""))
+	n = strings.TrimPrefix(n, "PT ")
+	for _, suf := range []string{", Tbk.", ", Tbk", " Tbk.", " Tbk"} {
+		n = strings.TrimSuffix(n, suf)
+	}
+	return strings.TrimSpace(n)
+}
+
+func lookupYahoo(ctx context.Context, symbol string) (*models.InstrumentCandidate, error) {
+	base := strings.TrimRight(env("YAHOO_CHART_URL", "https://query1.finance.yahoo.com/v8/finance/chart"), "/")
+	var r struct {
+		Chart struct {
+			Result []struct {
+				Meta struct {
+					Currency       string   `json:"currency"`
+					ExchangeName   string   `json:"exchangeName"`
+					InstrumentType string   `json:"instrumentType"`
+					LongName       string   `json:"longName"`
+					ShortName      string   `json:"shortName"`
+					Price          *float64 `json:"regularMarketPrice"`
+				} `json:"meta"`
+			} `json:"result"`
+			Error *struct {
+				Code        string `json:"code"`
+				Description string `json:"description"`
+			} `json:"error"`
+		} `json:"chart"`
+	}
+	code, err := getJSON(ctx, base+"/"+url.PathEscape(symbol)+"?range=5d&interval=1d", &r)
+	if err != nil {
+		return nil, unreachable("Yahoo Finance", err)
+	}
+	if r.Chart.Error != nil || len(r.Chart.Result) == 0 {
+		return nil, notListed("%s tidak ditemukan di Yahoo Finance.", symbol)
+	}
+	if code/100 != 2 {
+		return nil, unreachable("Yahoo Finance", fmt.Errorf("HTTP %d", code))
+	}
+	m := r.Chart.Result[0].Meta
+	if m.Currency != "IDR" || m.ExchangeName != "JKT" {
+		return nil, notListed("%s bukan saham Bursa Efek Indonesia (bursa %s, mata uang %s).", symbol, m.ExchangeName, m.Currency)
+	}
+	if m.InstrumentType != "" && m.InstrumentType != "EQUITY" {
+		return nil, notListed("%s bukan saham (jenis %s).", symbol, m.InstrumentType)
+	}
+	name := m.LongName
+	if name == "" {
+		name = m.ShortName
+	}
+	return &models.InstrumentCandidate{Symbol: symbol, Name: cleanStockName(name), AssetType: "stock", Source: "yahoo",
+		Currency: "IDR", Exchange: "Bursa Efek Indonesia (Yahoo Finance)", Price: m.Price}, nil
+}
+
+func lookupBinanceSpot(ctx context.Context, symbol string) (*models.InstrumentCandidate, error) {
+	base := binanceBase("BINANCE_URL", "https://data-api.binance.vision/api/v3/klines")
+	var r struct {
+		Code    int    `json:"code"`
+		Msg     string `json:"msg"`
+		Symbols []struct {
+			Symbol     string `json:"symbol"`
+			Status     string `json:"status"`
+			BaseAsset  string `json:"baseAsset"`
+			QuoteAsset string `json:"quoteAsset"`
+		} `json:"symbols"`
+	}
+	code, err := getJSON(ctx, base+"exchangeInfo?symbol="+url.QueryEscape(symbol), &r)
+	if err != nil {
+		return nil, unreachable("Binance", err)
+	}
+	if r.Code == -1121 || (code/100 == 2 && len(r.Symbols) == 0) {
+		return nil, notListed("%s tidak ada di Binance spot. Kontrak komoditas (mis. XAUUSDT) ditambahkan sebagai Komoditas.", symbol)
+	}
+	if code/100 != 2 {
+		return nil, unreachable("Binance", fmt.Errorf("HTTP %d %s", code, r.Msg))
+	}
+	s := r.Symbols[0]
+	if s.Status != "TRADING" {
+		return nil, notListed("%s di Binance spot berstatus %s, bukan TRADING.", symbol, s.Status)
+	}
+	return &models.InstrumentCandidate{Symbol: symbol, Name: s.BaseAsset, AssetType: "crypto", Source: "binance",
+		Currency: "USD", Exchange: "Binance spot", Price: binancePrice(ctx, base, symbol)}, nil
+}
+
+func lookupBinanceFutures(ctx context.Context, symbol string) (*models.InstrumentCandidate, error) {
+	base := binanceBase("BINANCE_FUTURES_URL", "https://fapi.binance.com/fapi/v1/klines")
+	var r struct {
+		Symbols []struct {
+			Symbol         string `json:"symbol"`
+			Status         string `json:"status"`
+			BaseAsset      string `json:"baseAsset"`
+			QuoteAsset     string `json:"quoteAsset"`
+			UnderlyingType string `json:"underlyingType"` // COMMODITY untuk TradFi perpetual
+		} `json:"symbols"`
+	}
+	code, err := getJSON(ctx, base+"exchangeInfo", &r)
+	if err != nil {
+		return nil, unreachable("Binance Futures", err)
+	}
+	if code/100 != 2 {
+		return nil, unreachable("Binance Futures", fmt.Errorf("HTTP %d", code))
+	}
+	for _, s := range r.Symbols {
+		if s.Symbol != symbol {
+			continue
+		}
+		if s.UnderlyingType != "COMMODITY" {
+			hint := ""
+			if s.UnderlyingType == "COIN" {
+				hint = " Untuk kripto, tambahkan sebagai Kripto (Binance spot)."
+			}
+			return nil, notListed("%s di Binance Futures bertipe %s, bukan komoditas.%s", symbol, s.UnderlyingType, hint)
+		}
+		if s.Status != "TRADING" {
+			return nil, notListed("%s di Binance Futures berstatus %s, bukan TRADING.", symbol, s.Status)
+		}
+		return &models.InstrumentCandidate{Symbol: symbol, Name: s.BaseAsset, AssetType: "commodity", Source: "binance_futures",
+			Currency: "USD", Exchange: "Binance USDⓈ-M futures (TradFi perpetual)", Price: binancePrice(ctx, base, symbol)}, nil
+	}
+	return nil, notListed("%s tidak ada di Binance USDⓈ-M futures.", symbol)
+}
+
+// lookupSource: normalisasi + cek ke sumber, tanpa database.
+func lookupSource(ctx context.Context, assetType, raw string) (*models.InstrumentCandidate, error) {
+	symbol, err := normalizeSymbol(assetType, raw)
+	if err != nil {
+		return nil, err
+	}
+	switch assetType {
+	case "stock":
+		return lookupYahoo(ctx, symbol)
+	case "crypto":
+		return lookupBinanceSpot(ctx, symbol)
+	default:
+		return lookupBinanceFutures(ctx, symbol)
+	}
+}
+
+func (a *AdminService) lookupInstrument(ctx context.Context, assetType, raw string) (*models.InstrumentCandidate, error) {
+	cand, err := lookupSource(ctx, assetType, raw)
+	if err != nil {
+		return nil, err
+	}
+	id, err := a.store.InstrumentID(ctx, cand.Symbol)
+	switch {
+	case err == nil:
+		cand.ID, cand.Exists = id, true
+	case !errors.Is(err, ErrNotFound):
+		return nil, err
+	}
+	return cand, nil
+}
+
+// LookupInstrument: GET /api/admin/instruments/lookup?asset_type=&symbol= (pratinjau, tanpa menyimpan).
+func (a *AdminService) LookupInstrument(ctx context.Context, assetType, symbol string) (*models.InstrumentCandidate, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return a.lookupInstrument(ctx, assetType, symbol)
+}
+
+// AddInstrument: POST /api/admin/instruments {"asset_type", "symbol", "name"?}. ip hanya untuk log.
+func (a *AdminService) AddInstrument(ctx context.Context, assetType, symbol, name, ip string) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cand, err := a.lookupInstrument(ctx, assetType, symbol) // selalu dicek ulang di server
+	if err != nil {
+		return nil, err
+	}
+	if cand.Exists {
+		return nil, newError(http.StatusConflict, "", cand.Symbol+" sudah terdaftar.")
+	}
+	if name := strings.TrimSpace(name); name != "" {
+		cand.Name = name
+	}
+	if utf8.RuneCountInString(cand.Name) > 80 {
+		cand.Name = string([]rune(cand.Name)[:80])
+	}
+	id, err := a.store.AddInstrument(ctx, cand.Symbol, cand.Name, cand.AssetType, cand.Source)
+	if errors.Is(err, ErrExists) {
+		return nil, newError(http.StatusConflict, "", cand.Symbol+" sudah terdaftar.")
+	}
+	if err != nil {
+		return nil, err
+	}
+	cand.ID, cand.Exists = id, true
+	slog.Info("instrumen ditambahkan", "symbol", cand.Symbol, "asset_type", cand.AssetType, "source", cand.Source, "ip", ip)
+	started := a.ingest.start(cand.Symbol, cand.AssetType)
+
+	notes := []string{"Backfill candle 1 jam dan harian (±1 tahun) berjalan di background, biasanya 1–3 menit. " +
+		"Statusnya tampil di tabel; analisis AI baru bisa dibuat setelah candle tersedia."}
+	if cand.Source != "yahoo" {
+		notes = append(notes, "Harga live WebSocket untuk instrumen ini aktif setelah backend di-restart. "+
+			"Sebelum itu harga diambil dari candle 1 jam terakhir.")
+	}
+	if a.dynamicTTL() != nil {
+		notes = append(notes, "σ_ref untuk TTL dinamis dihitung saat backend start; sampai restart, TTL instrumen ini memakai TTL_min.")
+	}
+	notes = append(notes, "Instance lab (port 8101–8115) yang sedang berjalan tidak ikut sampai di-restart. "+
+		"Jangan menambah instrumen di tengah eksperimen.")
+	return map[string]any{"instrument": cand, "ingest_started": started, "notes": notes}, nil
+}
+
+// Reingest: POST /api/admin/instruments/:symbol/ingest, jalankan ulang backfill. ErrNotFound kalau
+// instrument tidak ada.
+func (a *AdminService) Reingest(ctx context.Context, symbol string) (map[string]any, error) {
+	symbol = strings.ToUpper(symbol)
+	assetType, err := a.store.InstrumentAssetType(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	if !a.ingest.start(symbol, assetType) {
+		return nil, newError(http.StatusConflict, "", "Backfill "+symbol+" sedang berjalan.")
+	}
+	return map[string]any{"symbol": symbol, "ingest_started": true}, nil
+}
+
+// Instruments: GET /api/admin/instruments, daftar instrumen + status data dan backfill.
+func (a *AdminService) Instruments(ctx context.Context) (map[string]any, error) {
+	list, err := a.store.AdminInstruments(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dyn := a.dynamicTTL()
+	counts := map[string]int{}
+	for _, in := range list {
+		counts[in.AssetType]++
+		in.DisplaySymbol, _ = displayOf(in.Symbol, in.AssetType)
+		in.Ingesting = a.ingest.running(in.Symbol)
+		if in.Source != "yahoo" && a.prices != nil {
+			live := a.prices.Tracks(in.Symbol)
+			in.LivePrice = &live
+		}
+		if dyn != nil {
+			known := dyn.ref[in.Symbol] > 0
+			in.SigmaRef = &known
+		}
+	}
+	return map[string]any{
+		"instruments": list, "counts": counts, "price_feed": a.prices != nil, "cache_mode": a.policy.Name(),
+	}, nil
+}
+
+// dynamicTTL: model TTL dinamis kondisi ini, nil kalau kondisi tidak memakainya.
+func (a *AnalysisService) dynamicTTL() *DynamicTTL {
+	if rp, ok := a.policy.(*RedisPolicy); ok {
+		return rp.dyn
+	}
+	return nil
+}
