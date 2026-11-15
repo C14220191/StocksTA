@@ -27,6 +27,9 @@ type Watcher struct {
 	svc    *AnalysisService
 	policy *RedisPolicy
 
+	// candles: candle 1h tertutup terakhir untuk model indikator (diganti di tes)
+	candles func(ctx context.Context, instID int) ([]models.Candle, error)
+
 	mu      sync.Mutex
 	entries map[watchKey]*watchEntry
 	models  map[string]*IndicatorModel // per symbol
@@ -41,6 +44,9 @@ type watchEntry struct {
 
 func NewWatcher(svc *AnalysisService, policy *RedisPolicy) *Watcher {
 	w := &Watcher{svc: svc, policy: policy, entries: map[watchKey]*watchEntry{}, models: map[string]*IndicatorModel{}}
+	w.candles = func(ctx context.Context, instID int) ([]models.Candle, error) {
+		return svc.store.LatestCandles(ctx, instID, analysisTimeframe, stateCandles)
+	}
 	policy.watcher = w
 	return w
 }
@@ -48,9 +54,20 @@ func NewWatcher(svc *AnalysisService, policy *RedisPolicy) *Watcher {
 func (w *Watcher) Track(symbol, method string, s models.CachedSummary, expiresAt time.Time) {
 	w.mu.Lock()
 	w.entries[watchKey{symbol, method}] = &watchEntry{summary: s, expiresAt: expiresAt}
-	_, hasModel := w.models[symbol]
+	// Model indikator harus dibangun dari candle yang sama dengan saat summary dibuat (SourceDataTS =
+	// candle tertutup terakhir). Run hanya me-refresh simbol yang punya entri hidup, jadi model simbol
+	// yang entrinya sudah habis bisa tertinggal berjam-jam; S dari candle lama + harga sekarang membuat
+	// entri baru langsung dibuang sebagai state_change. Model seperti itu dilepas dan dimuat ulang;
+	// sampai siap, S tidak diperiksa (drift harga tetap diperiksa).
+	reload := false
+	if w.policy.checkState {
+		if m := w.models[symbol]; m == nil || !m.LastClosedTS.Equal(s.SourceDataTS) {
+			delete(w.models, symbol)
+			reload = true
+		}
+	}
 	w.mu.Unlock()
-	if !hasModel && w.policy.checkState {
+	if reload {
 		go w.loadModel(context.Background(), symbol, s.InstrumentID)
 	}
 }
@@ -67,6 +84,13 @@ func (w *Watcher) OnTick(symbol string, price float64, ts time.Time) {
 }
 
 func (w *Watcher) check(symbol string, price float64, crossedAt time.Time) {
+	for _, inv := range w.due(symbol, price, crossedAt) {
+		go w.invalidate(symbol, inv)
+	}
+}
+
+// due: entri simbol ini yang harus dibuang pada harga ini (dan sudah dilepas dari pelacakan).
+func (w *Watcher) due(symbol string, price float64, crossedAt time.Time) []*Invalidation {
 	var fired []*Invalidation
 	now := time.Now()
 	w.mu.Lock()
@@ -91,9 +115,7 @@ func (w *Watcher) check(symbol string, price float64, crossedAt time.Time) {
 		}
 	}
 	w.mu.Unlock()
-	for _, inv := range fired {
-		go w.invalidate(symbol, inv)
-	}
+	return fired
 }
 
 func (w *Watcher) invalidate(symbol string, inv *Invalidation) {
@@ -106,7 +128,7 @@ func (w *Watcher) invalidate(symbol string, inv *Invalidation) {
 }
 
 func (w *Watcher) loadModel(ctx context.Context, symbol string, instID int) *IndicatorModel {
-	candles, err := w.svc.store.LatestCandles(ctx, instID, analysisTimeframe, stateCandles)
+	candles, err := w.candles(ctx, instID)
 	if err != nil {
 		slog.Warn("watcher: gagal memuat candle", "symbol", symbol, "err", err)
 		return nil
